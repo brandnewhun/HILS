@@ -1,0 +1,146 @@
+#!/bin/sh
+#
+# ============================================================================
+# 이 파일은 실제 airbility-dev/px4-custom-firmware 저장소가 이 세션(작업 디렉터리)에
+# 없어서 직접 그 자리에 만들 수 없었던 "초안(draft)"입니다. 실제 저장소에서는
+# 아래 경로에 그대로 옮겨 놓으면 됩니다(파일명이 곧 SYS_AUTOSTART 번호이므로
+# 파일명을 유지):
+#
+#   ROMFS/px4fmu_common/init.d/airframes/9001_airbility_tiltvtol
+#
+# 방금 콘솔 로그에서 확인된 사실 기반으로 작성했지만, 아래 표시된 "★ 검증 필요 ★"
+# 구간은 tv_control_allocator/ruddervator 모듈 소스(params.c 또는 module.yaml)를
+# 직접 열어서 대조하기 전까지는 실제 동작을 보장 못 하는 예시값입니다 —
+# 사용자 요청대로 "임의 값 + 주석"으로 채워 나중에 쉽게 고칠 수 있게 만들었습니다.
+#
+# 번호 9001은 PX4 상류 airframe(1xxx~ 대역 등)과 충돌하지 않도록 높은 대역에서
+# 예시로 고른 것뿐입니다 — 실제로 넣기 전에 반드시
+#   grep -rn "^90" ROMFS/px4fmu_common/init.d/airframes/
+# 로 이미 쓰이는 번호가 없는지 확인하세요(겹치면 빌드가 애매하게 동작합니다).
+# ============================================================================
+#
+# @name Airbility Tilt-Rotor VTOL (4 motor + 4 tilt + 2 ruddervator)
+#
+# @type VTOL Tiltrotor
+# @class VTOL
+#
+# @output MC_Motor1 motor 1
+# @output MC_Motor2 motor 2
+# @output MC_Motor3 motor 3
+# @output MC_Motor4 motor 4
+# @output Tilt_Servo1 tilt servo 1 (Dynamixel, RS-485)
+# @output Tilt_Servo2 tilt servo 2 (Dynamixel, RS-485)
+# @output Tilt_Servo3 tilt servo 3 (Dynamixel, RS-485)
+# @output Tilt_Servo4 tilt servo 4 (Dynamixel, RS-485)
+# @output Ruddervator1 ruddervator 1 (Dynamixel, RS-485)
+# @output Ruddervator2 ruddervator 2 (Dynamixel, RS-485)
+#
+# @board px4_fmu-v6c
+#
+# ============================================================================
+# ★ 검증 필요 ★ — rc.vtol_apps 소싱 구문
+#   실제 경로/파일명이 이게 맞는지, 이미 저장소에 있는 다른 4~5자리 VTOL
+#   airframe 파일(rc.vtol_apps를 쓰는 파일이 있다면 그 파일)을 열어서
+#   정확히 같은 문법으로 맞춰 넣으세요. 예시(표준 PX4 관례 기준 추정):
+# ============================================================================
+. ${R}etc/init.d/rc.vtol_apps
+
+# ----------------------------------------------------------------------------
+# MAV_TYPE — 이건 자신 있게 넣을 수 있는 값입니다. MAV_TYPE=20은 MAVLink 공식
+# 스펙의 MAV_TYPE_VTOL_TILTROTOR 상수(고정값)이고, 지금 콘솔에서 확인된 MAV_TYPE=0
+# (제네릭)을 이걸로 바로잡는 게 이번 airframe 파일의 핵심 목적 중 하나입니다.
+# ----------------------------------------------------------------------------
+param set-default MAV_TYPE 20
+
+# ============================================================================
+# ★★★ 검증 필요 ★★★ — 로터(모터) 지오메트리 / 제어배분(Control Allocation)
+#
+# CA_ROTOR* 라는 파라미터 그룹 이름 자체는 실제 보드(flash)에서 확인된 것이라
+# 그대로 썼지만, 아래 인덱스별 위치/부호/단위가 tv_control_allocator 모듈이
+# 실제로 기대하는 것과 일치하는지는 그 모듈의 params.c(또는 module.yaml)를 열어
+# 반드시 대조하세요. 좌표계는 PX4 표준 기체 좌표계(FRD: X=전방, Y=우측, Z=하방,
+# 단위 m)를 가정한 예시값이며, 아래 수치 자체는 HILS_ICD/sim/quadrotor_hud_v2.html의
+# createTiltrotorVehicle() 시각화용 형상 비율을 참고해 "그럴듯한 예시"로 환산한
+# 것일 뿐 실측 CAD 치수가 아닙니다 — 실제 기체 도면 치수로 반드시 교체하세요.
+# ============================================================================
+param set-default CA_ROTOR_COUNT 4
+
+# 로터0: 전방-우 (Front-Right)
+param set-default CA_ROTOR0_PX 0.35
+param set-default CA_ROTOR0_PY 0.45
+param set-default CA_ROTOR0_PZ 0.0
+param set-default CA_ROTOR0_KM 0.05   # 반작용 토크 계수 — [TBD] 모터/프롭 사양 확정 후 교체
+param set-default CA_ROTOR0_TILT 0    # 이 로터가 몇 번 틸트 서보(아래 CA_SV_TL 인덱스)에 연동되는지
+
+# 로터1: 전방-좌 (Front-Left)
+param set-default CA_ROTOR1_PX 0.35
+param set-default CA_ROTOR1_PY -0.45
+param set-default CA_ROTOR1_PZ 0.0
+param set-default CA_ROTOR1_KM -0.05
+param set-default CA_ROTOR1_TILT 1
+
+# 로터2: 후방-우 (Rear-Right)
+param set-default CA_ROTOR2_PX -0.45
+param set-default CA_ROTOR2_PY 0.55
+param set-default CA_ROTOR2_PZ 0.0
+param set-default CA_ROTOR2_KM -0.05
+param set-default CA_ROTOR2_TILT 2
+
+# 로터3: 후방-좌 (Rear-Left)
+param set-default CA_ROTOR3_PX -0.45
+param set-default CA_ROTOR3_PY -0.55
+param set-default CA_ROTOR3_PZ 0.0
+param set-default CA_ROTOR3_KM 0.05
+param set-default CA_ROTOR3_TILT 3
+
+# ============================================================================
+# ★★ 검증 필요 ★★ — 틸트 서보 4개 (CA_SV_TL*)
+#
+# TMIN=0 / TMAX=90은 예시가 아니라, ICD-PXTR-HILS-001에 이미 문서화된 실제
+# 프로젝트 확정 컨벤션입니다: 0°=수직(MC 모드), 90°=수평(FW 모드). 이 두 값은
+# 그대로 써도 됩니다. TDEFAULT/TRAVEL, 그리고 TN_P/TN_Q/TN_R(틸트각에 따른
+# 자세 토크 기여 계수)은 tv_control_allocator 실제 정의와 대조 필요.
+# TV_FO_PITCH_L(75)/TV_FO_PITCH_U(85)/TV_TILT_LOCK(85) 등 이미 저장된 TV_* 값과
+# 모순되지 않는지도 같이 확인하세요(전이(transition) 구간 정의가 겹치는 파라미터군).
+# ============================================================================
+param set-default CA_SV_TL_COUNT 4
+
+param set-default CA_SV_TL0_TDEFAULT 0
+param set-default CA_SV_TL0_TMIN 0
+param set-default CA_SV_TL0_TMAX 90
+
+param set-default CA_SV_TL1_TDEFAULT 0
+param set-default CA_SV_TL1_TMIN 0
+param set-default CA_SV_TL1_TMAX 90
+
+param set-default CA_SV_TL2_TDEFAULT 0
+param set-default CA_SV_TL2_TMIN 0
+param set-default CA_SV_TL2_TMAX 90
+
+param set-default CA_SV_TL3_TDEFAULT 0
+param set-default CA_SV_TL3_TMIN 0
+param set-default CA_SV_TL3_TMAX 90
+
+# ============================================================================
+# ★★★ 가장 불확실한 구간 ★★★ — 러더베이터(ruddervator) 2개
+#
+# 표준 PX4 control allocation에는 "control surface"용 CA_SV_CS* 파라미터군이
+# 있지만, 이 프로젝트는 ruddervator/tv_pos_control이라는 완전 커스텀 모듈이라
+# 실제로 CA_SV_CS*를 그대로 쓰는지, 아니면 별도 파라미터 그룹(예: 다른 접두어)을
+# 새로 정의했는지 코드로 반드시 확인 후 이 블록 전체를 고쳐 쓰세요. 지금은
+# "이 자리에 러더베이터 설정이 들어가야 한다"는 자리표시자(placeholder)로만
+# 남겨둡니다.
+# ============================================================================
+# param set-default CA_SV_CS_COUNT 2
+# param set-default CA_SV_CS0_TYPE <ruddervator 좌현/우현 타입 상수 확인 필요>
+# param set-default CA_SV_CS1_TYPE <ruddervator 좌현/우현 타입 상수 확인 필요>
+
+# ============================================================================
+# 적용 방법 (참고)
+#   1) 위 검증 필요 구간을 실제 모듈 소스와 대조해 수정
+#   2) 이 파일을 저장소의 정확한 경로에 배치
+#   3) 빌드 후 보드에 플래시 (또는 이미 올라간 펌웨어라면 SD카드/재빌드로 반영)
+#   4) QGC 또는 NSH 콘솔에서: param set SYS_AUTOSTART 9001 → param save → reboot
+#   5) 재부팅 로그에서 "No file matches SYS_AUTOSTART" 에러가 사라지고
+#      MAV_TYPE=20, CA_ROTOR_COUNT=4 등이 반영됐는지 재확인
+# ============================================================================
