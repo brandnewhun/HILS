@@ -115,6 +115,32 @@
        틈은 가리고 지면 위로 확장된 형상은 만들지 않음. 충돌용 baseY/roof는 유지.
      - 건물 주변 AO와 건물의 shadow-map 투영을 비활성화하여, 지면에 건물 외곽을
        따라 생기던 어두운 띠를 제거.
+ v16 v10~v15에서 계속 신고됐던 "건물/고가도로가 허공에 떠 보인다"의 진짜
+     원인을 찾아 수정 — 조명 문제가 아니라 지형 메시의 남북 반전이었다.
+     ※ heights 배열은 원본 SRTM 취득 순서대로 "행 0 = 최남단(north = -250m)"
+       이다(_terrain_raw/elev_grid_points_hi.json 의 pts[0].lat = 37.27684 <
+       meta.lat = 37.27909). sampleHeight(), 건물 baseY/renderBaseY, 도로
+       표고(ROAD_COLLIDERS.surfaceY), 지형 정점색 AO 는 전부 이 규약대로
+       계산된다. 그런데 buildTerrain()은 THREE.PlaneGeometry 의 정점 순서
+       (iy=0 이 +Y = rotateX(-90°) 후 북쪽)를 그대로 heights[iy*N+ix] 에
+       대응시켜서, "보이는 지형만" 남북이 뒤집혀 있었다.
+     - 불일치 크기(실측): 격자 전체 평균 4.94m, 최대 20.0m.
+       건물 54동의 지반 표고 오차는 평균 3.7m, 최대 15.6m. 최악 지점 —
+       E102.2/N111.0 (정상 0.1m vs 반전 -15.5m, 차이 15.6m, 건물높이 10.2m),
+       E103.4/N89.4 (13.8m), E84.3/N134.0 (13.2m), E86.9/N155.1 (11.5m).
+     - 이 좌표대는 v14 에 적힌 재발 신고 구역("로컬 NED 대략 N39~250,
+       E88~119 부근, 아파트 단지 여러 동")과 정확히 겹친다. 건물 높이보다
+       큰 13~15.6m 만큼 지형이 어긋나 있었으니, v10~v15 에서 스커트/plinth/
+       AO/emissive 로 손봤던 것은 증상 완화였고 근본 원인은 이 좌표 불일치였다.
+     - 수정: buildTerrain()에서 정점 높이를 넣을 때 행 인덱스를 뒤집어
+       heights[(N-1-row)*N + col] 을 쓴다. 이제 보이는 지형이 sampleHeight()
+       및 건물/도로와 정확히 일치한다.
+     ※ 발견 경위: AirSim(Unreal) 포팅(HILS_ICD/sim/airsim/)에서 같은 지형
+       로직을 파이썬으로 옮겨 원본 SRTM 취득 순서와 대조하다 드러났다.
+       v10~v15 에서 손댄 스커트/plinth/AO/emissive 는 되돌리지 않고 그대로
+       둔다(경계가 또렷해지는 효과가 있고 이번 수정과 상충하지 않는다).
+     ※ v1(quadrotor_hud.html)은 frozen 이므로 같은 버그가 남아 있다 —
+       필요하면 buildTerrain() 한 곳만 같이 고치면 된다.
  ────────────────────────────────────────────────────────────
  v2 (본 파일, quadrotor_hud_v2.html — v1(quadrotor_hud.html)에서 분기)
      PX4 실물 보드 + HITL 브릿지(Python, ../bridge/) 연동 버전. v1까지의
@@ -144,20 +170,34 @@
        있게 applyTelemetry()에 훅만 남겨둠.
      ※ 상세 채널 정의는 ICD-PXTR-HILS-001.docx / EICD-PXTR-HILS-001.docx,
        브릿지 쪽 구현은 HILS_ICD/sim/bridge/ 참조.
-     추가(다른 세션) — 실기 액추에이터 표시 + 경량 Python 브릿지 연동:
+     추가 — 실기 액추에이터 표시 + 경량 Python 브릿지 연동:
      - PX4가 HIL이 아니라 평소(SYS_HITL=0) 모드로 떠서 실제 RC 입력을 받아
        스스로 자세를 추정하고 액추에이터를 구동하는 상황(HIL_SENSOR 주입도,
        브릿지의 자체 FDM도 필요 없음)을 위해, sim/bridge/(HIL 폐루프 전용)와는
        별개로 sim/py/px4_link.py + live_vehicle_source.py + telemetry_ws_server.py
-       + run_live_3d.py를 추가했다. 이쪽은 MAVLink를 "읽기만" 하고, 여기 이
-       HTML이 기대하는 것과 같은 JSON(north/east/alt/roll/pitch/heading/
+       + run_live_3d.py를 추가했다. 이쪽은 처음엔 MAVLink를 "읽기만" 했고, 여기
+       이 HTML이 기대하는 것과 같은 JSON(north/east/alt/roll/pitch/heading/
        yawRate/vN/vE/climbRate/tilt)에 armed/mode/servoOutputs만 얹어 그대로
-       내보낸다 — 그래서 어느 브릿지를 쓰든 이 HTML은 수정할 필요가 없다.
+       내보냈다 — 그래서 어느 브릿지를 쓰든 이 HTML은 수정할 필요가 없었다.
      - applyTelemetry()가 이미 pkt 전체를 onTelemetry 콜백에 넘겨주고 있어서,
        armed/mode/servoOutputs는 FlightSim을 안 건드리고 HUD의 콜백에서만
        추가로 읽어 새 패널(#actuator-panel)에 그대로 찍는다. 이 필드가 없는
        패킷(기존 HIL 브릿지)에서는 패널이 계속 숨겨진 채로 있어 기존 화면과
        동일하게 동작한다.
+     추가 — 키보드 조종 입력을 실기로 송신(양방향으로 확장):
+     - px4_link.py에 send_manual_control() 추가 — 위 스냅샷 읽기와 별개로
+       MANUAL_CONTROL 메시지를 실제 Pixhawk에 보낼 수 있게 됨. telemetry_ws_
+       server.py도 브라우저 -> 서버 방향 메시지를 무시하지 않고 콜백으로
+       넘기도록 확장(양방향).
+     - MODULE: RcTx(신규) — v1(quadrotor_hud.html)과 동일한 키맵(화살표=피치/롤,
+       A/D=요, W/S=스로틀)으로 키보드를 읽어 BridgeLink.send()로 10Hz 송신한다.
+       v1과 달리 여기서 값을 "계산"하지 않는다 — 그냥 그대로 보내고, 그 결과
+       실기가 계산한 진짜 자세/위치가 텔레메트리로 돌아와 화면에 반영되는
+       완전한 폐루프다. 탭이 포커스를 잃으면(예: 다른 창으로 전환) 눌려있던
+       키를 전부 놓은 것으로 처리해, 자리를 비운 사이 계속 조종 입력이
+       나가는 일이 없게 했다.
+     ⚠ 프로펠러를 뺀 상태에서 먼저 테스트할 것. PX4가 MANUAL_CONTROL을 받으려면
+       COM_RC_IN_MODE가 Joystick(또는 동급)이어야 한다 — px4_link.py 참조.
 
  유지보수 메모
  --------------------------------------------------------------
@@ -413,11 +453,25 @@
   </div>
 
   <div class="legend panel">
+    <!-- 실기 조종 입력 — 키보드로 입력한 값을 MANUAL_CONTROL로 실제 Pixhawk에 그대로
+         보낸다(px4_link.py의 send_manual_control 참조). v1(quadrotor_hud.html)과
+         동일한 키맵을 그대로 재사용해서 조종 감각이 안 바뀌게 했다. -->
+    <div class="group"><span class="group-label">Pitch/Roll</span><span class="key">&uarr;</span><span class="key">&darr;</span><span class="key">&larr;</span><span class="key">&rarr;</span></div>
+    <div class="sep"></div>
+    <div class="group"><span class="group-label">Yaw</span><span class="key">A</span><span class="key">D</span></div>
+    <div class="sep"></div>
+    <div class="group"><span class="group-label">Throttle</span><span class="key">W</span><span class="key">S</span></div>
+    <div class="sep"></div>
     <div class="group"><span class="group-label">Target 선회/승강</span><span class="key">I</span><span class="key">J</span><span class="key">K</span><span class="key">L</span></div>
     <div class="sep"></div>
     <div class="group"><span class="group-label">Target 속도</span><span class="key">U</span><span class="key">O</span></div>
     <div class="sep"></div>
-    <div class="rc-link" id="bridge-link" title="PX4 HITL 브릿지 WebSocket 링크 — Channel C(ICD C-01~C-06) 텔레메트리 수신 시 점멸">
+    <div class="rc-link" id="rc-tx-link" title="브라우저 → 실기 조종 입력 송신 — MANUAL_CONTROL, 10 Hz 샘플-홀드">
+      <span class="rc-dot" id="rc-tx-dot"></span>
+      <span class="rc-text"><b style="color:var(--hud)">RC&rarr;FCC</b> MANUAL_CONTROL &middot; 10 Hz</span>
+    </div>
+    <div class="sep"></div>
+    <div class="rc-link" id="bridge-link" title="PX4 브릿지 WebSocket 링크 — Channel C(ICD C-01~C-06) 텔레메트리 수신 시 점멸">
       <span class="rc-dot" id="rc-dot"></span>
       <span class="rc-text" id="bridge-text"><b style="color:var(--hud)">BRIDGE</b> 연결 중&hellip;</span>
     </div>
@@ -970,6 +1024,14 @@ var TERRAIN_DATA = {"meta":{"lat":37.27908611111111,"lon":127.10344722222221,"or
       }
     }
 
+    // 브라우저 -> 서버 방향 송신(신규) -- 키보드 RC 입력을 실기로 보내는 데 쓴다
+    // (RcTx 모듈 참조). 연결 안 돼있으면 조용히 버린다.
+    function send(obj){
+      if (ws && status === "open"){
+        try { ws.send(JSON.stringify(obj)); } catch (e){}
+      }
+    }
+
     window.addEventListener("keydown", function(e){
       if (e.key.toLowerCase() === "r") forceReconnect();
     });
@@ -981,11 +1043,65 @@ var TERRAIN_DATA = {"meta":{"lat":37.27908611111111,"lon":127.10344722222221,"or
       get status(){ return status; },
       onMessage: function(fn){ onMessageCb = fn; },
       onStatusChange: function(fn){ onStatusCb = fn; },
-      forceReconnect: forceReconnect
+      forceReconnect: forceReconnect,
+      send: send
     };
   })();
 
   BridgeLink.onMessage(function(pkt){ FlightSim.applyTelemetry(pkt); });
+
+
+  // ==============================================================================
+  // MODULE: RcTx — 키보드 조종 입력을 BridgeLink로 실기(run_live_3d.py)에 보낸다.
+  //
+  // v1(quadrotor_hud.html)의 FlightSim은 이 키 입력으로 "로컬 물리"를 계산했지만,
+  // v2는 로컬 물리가 없으므로(상태의 진실은 항상 실기) 여기서는 값을 계산하지 않고
+  // 그대로 -1..1 정규화해서 브릿지에 보내기만 한다. 실제 자세/위치 변화는 그 결과로
+  // Pixhawk가 계산해 돌려주는 텔레메트리(BridgeLink.onMessage -> applyTelemetry)로
+  // 화면에 반영된다 — 입력과 표시가 완전히 분리된 폐루프.
+  //
+  // 키맵은 v1과 동일: 화살표=피치/롤, A/D=요, W/S=스로틀. Target 조종(IJKL/UO)과
+  // 겹치지 않는다(TargetDrone은 별도 keys 객체를 자체적으로 관리).
+  // ==============================================================================
+  var RcTx = (function(Link){
+    var RC_HZ = 10; // ICD D-01(RC_CHANNELS)과 동일한 샘플-홀드 주기
+    var keys = Object.create(null);
+    var accum = 0;
+
+    window.addEventListener("keydown", function(e){
+      if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].indexOf(e.key) !== -1) e.preventDefault();
+      keys[e.key.toLowerCase()] = true;
+    }, {passive:false});
+    window.addEventListener("keyup", function(e){
+      keys[e.key.toLowerCase()] = false;
+    });
+
+    // 창(탭) 포커스를 잃으면 눌려있던 키 상태가 keyup 없이 그대로 "눌린 채" 남을 수
+    // 있다 — 실기를 조종하는 상황에서는 이게 v1(순수 시뮬레이션)보다 훨씬 위험하므로
+    // (조종석을 떠난 사이 계속 전진 명령이 나가는 것과 같음) 포커스 이탈 시 전부 놓는다.
+    window.addEventListener("blur", function(){ keys = Object.create(null); });
+
+    function tick(dt){
+      accum += dt;
+      var interval = 1 / RC_HZ;
+      if (accum < interval) return;
+      accum -= interval;
+
+      var pitch = (keys["arrowup"] ? 1 : 0) - (keys["arrowdown"] ? 1 : 0);
+      var roll  = (keys["arrowright"] ? 1 : 0) - (keys["arrowleft"] ? 1 : 0);
+      var yaw   = (keys["d"] ? 1 : 0) - (keys["a"] ? 1 : 0);
+      var thr   = (keys["w"] ? 1 : 0) - (keys["s"] ? 1 : 0);
+      Link.send({type:"rc", pitch:pitch, roll:roll, yaw:yaw, thr:thr});
+
+      var dotEl = document.getElementById("rc-tx-dot");
+      if (dotEl){
+        dotEl.classList.add("on");
+        setTimeout(function(){ dotEl.classList.remove("on"); }, 70);
+      }
+    }
+
+    return { tick: tick };
+  })(BridgeLink);
 
 
   // ==============================================================================
@@ -1274,8 +1390,16 @@ var TERRAIN_DATA = {"meta":{"lat":37.27908611111111,"lon":127.10344722222221,"or
       var ROAD_AO_BUFFER = 2.4, AO_MIN_SHADE = 0.55;
       var roads = TD.roads;
 
+      // v16: heights 배열은 원본 SRTM 취득 순서대로 "행 0 = 최남단(north = -halfSize)"
+      // 이다 (_terrain_raw/elev_grid_points_hi.json 의 pts[0].lat 37.27684 < meta.lat
+      // 37.27909). sampleHeight()/건물 baseY/도로 표고는 모두 이 규약을 따른다.
+      // 그런데 THREE.PlaneGeometry 의 정점 순서는 행 0 이 +Y(rotateX 후 북쪽)라서,
+      // heights[k] 를 그대로 넣으면 "보이는 지형만" 남북이 뒤집혔다. 행 인덱스를
+      // 뒤집어 데이터 규약에 맞춘다. (상세 경위는 파일 상단 v16 changelog 참조)
+      var HN = world.gridN;
       for (var k=0; k<tPos.count; k++){
-        var hgt = TD.heights[k];
+        var vRow = Math.floor(k / HN), vCol = k % HN;
+        var hgt = TD.heights[(HN - 1 - vRow) * HN + vCol];
         tPos.setY(k, hgt);
         var tNorm = (hgt - world.minHeight) / Math.max(1, (world.maxHeight - world.minHeight));
         var col = tNorm < 0.5
@@ -1901,6 +2025,7 @@ var TERRAIN_DATA = {"meta":{"lat":37.27908611111111,"lon":127.10344722222221,"or
     var dt = Math.min(0.05, (now - last)/1000);
     last = now;
     FlightSim.integrate(dt);
+    RcTx.tick(dt);
     TargetDrone.step(dt);
     activeRenderer.updateFromState(FlightSim.state);
     activeRenderer.updateTargetFromState(TargetDrone.state);

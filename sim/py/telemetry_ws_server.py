@@ -1,14 +1,12 @@
 """
 TelemetryWsServer -- state_provider() 콜백이 주는 dict를 주기적으로 JSON으로
-WebSocket 클라이언트(브라우저의 quadrotor_hud_v2.html)에 뿌리기만 하는 모듈.
+WebSocket 클라이언트(브라우저의 quadrotor_hud_v2.html)에 뿌리고, 반대로 브라우저가
+보내는 메시지(키보드 RC 입력)는 on_client_message 콜백으로 넘겨주는 양방향 모듈.
 
-sim/bridge/telemetry_hub.py(다른 세션이 만든, HIL 브릿지 전용)와 완전히 같은 설계
-원칙을 따른다 -- "텔레메트리가 어디서 오는지" 전혀 모르고 그냥 콜백이 주는 값을
-보내기만 한다. sim/py를 sim/bridge에 의존시키지 않기 위해 여기 별도로 자체
-구현했다(로직은 몇 줄 안 되는 얇은 래퍼라 중복이라 부를 것도 없다).
-
-브라우저는 수신 전용 클라이언트이므로, 클라이언트가 보내는 메시지는 읽기만 하고
-무시한다.
+sim/bridge/telemetry_hub.py(다른 세션이 만든, HIL 브릿지 전용 -- 수신 전용)와 설계
+원칙은 같다 -- "텔레메트리가 어디서 오는지/입력을 받아서 뭘 하는지" 전혀 모르고 그냥
+콜백만 연결한다. sim/py를 sim/bridge에 의존시키지 않기 위해 여기 별도로 자체
+구현했다.
 """
 from __future__ import annotations
 
@@ -27,11 +25,16 @@ def finite(value: Any, fallback: float = 0.0) -> float:
 
 
 class TelemetryWsServer:
-    def __init__(self, host: str, port: int, broadcast_hz: float, state_provider: Callable[[], dict[str, Any]]):
+    def __init__(self, host: str, port: int, broadcast_hz: float, state_provider: Callable[[], dict[str, Any]],
+                 on_client_message: Callable[[dict[str, Any]], None] | None = None):
         self.host = host
         self.port = port
         self.period = 1.0 / broadcast_hz
         self.state_provider = state_provider  # () -> dict, 스레드 세이프해야 함
+        # 브라우저(BridgeLink.send())가 보낸 메시지 1건마다 호출된다. asyncio 스레드에서
+        # 호출되므로, 이 콜백 안에서 다른 스레드의 상태를 건드릴 땐 그쪽에서 락 등으로
+        # 스레드 세이프하게 처리할 것(run_live_3d.py의 RcInputState가 그렇게 되어 있음).
+        self.on_client_message = on_client_message
         self._clients: set = set()
         self._thread: threading.Thread | None = None
 
@@ -53,8 +56,15 @@ class TelemetryWsServer:
         # 호출되므로 둘 다 받아들이도록 가변인자로 둔다.
         self._clients.add(websocket)
         try:
-            async for _ in websocket:
-                pass  # 브라우저 -> 서버 방향 메시지는 없음(수신 전용 링크) -- 들어와도 무시
+            async for raw in websocket:
+                if not self.on_client_message:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(msg, dict):
+                    self.on_client_message(msg)
         finally:
             self._clients.discard(websocket)
 

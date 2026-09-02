@@ -1,17 +1,27 @@
 """
-Px4Link -- 실제 Pixhawk 6C(또는 임의의 PX4 보드)에 MAVLink로 접속해 텔레메트리만
-"읽어오는" 얇은 래퍼. HIL 센서 주입이나 명령 송신은 하지 않는다.
+Px4Link -- 실제 Pixhawk 6C(또는 임의의 PX4 보드)에 MAVLink로 접속하는 얇은 래퍼.
 
-이건 PX4가 이미 정상(비-HIL) 모드로 떠서 실제 RC 입력을 받고, 스스로 자세를 추정하고
-액추에이터를 구동하는 상황(QGC로 관찰하던 벤치 테스트와 동일)을 그대로 관측하는
-용도다. 그래서 sim/bridge/mavlink_link.py(다른 세션이 만든, HIL_SENSOR를 주입하고
-그 응답으로 온 HIL_ACTUATOR_CONTROLS를 자체 FDM으로 해석하는 완전한 HIL 폐루프용
-모듈)와는 목적 자체가 다르다 -- 이쪽은 순수 리스너라 비행동역학모델(FDM)이 필요
-없다. PX4 자신이 이미 진짜 자세/위치/액추에이터 값을 계산해서 MAVLink로 흘려보내고
-있기 때문이다.
+이건 PX4가 HIL이 아니라 정상 모드로 떠서 스스로 자세를 추정하고 액추에이터를
+구동하는 상황(QGC로 관찰하던 벤치 테스트와 동일)을 그대로 관측 + 조종하는 용도다.
+그래서 sim/bridge/mavlink_link.py(다른 세션이 만든, HIL_SENSOR를 주입하고 그 응답으로
+온 HIL_ACTUATOR_CONTROLS를 자체 FDM으로 해석하는 완전한 HIL 폐루프용 모듈)와는
+목적 자체가 다르다 -- 이쪽은 비행동역학모델(FDM)이 필요 없다. PX4 자신이 이미 진짜
+자세/위치/액추에이터 값을 계산해서 MAVLink로 흘려보내주기 때문이다.
+
+두 방향으로 동작한다:
+  읽기 -- poll()/latest로 ATTITUDE/LOCAL_POSITION_NED/SERVO_OUTPUT_RAW/HEARTBEAT 관측.
+  쓰기 -- send_manual_control()로 조종 입력(피치/롤/요/스로틀)을 MANUAL_CONTROL
+          메시지로 실제 Pixhawk에 보낸다. HIL_SENSOR 주입이나 다른 명령은 여전히
+          보내지 않는다 -- 이 한 가지 메시지 타입만 추가된 것.
 
 이 모듈은 pymavlink 표준 다이얼렉트(common.xml)만 사용한다 -- 커스텀 틸트 메시지가
 필요 없는 것도 이쪽이 훨씬 단순한 이유 중 하나.
+
+⚠ send_manual_control()은 실제 기체를 움직이는 명령이다. 처음 연결할 때는 반드시
+프로펠러를 뺀 상태(또는 안전한 고정 지그)에서 테스트할 것. 또 PX4가 MAVLink
+조종 입력을 받아들이려면 COM_RC_IN_MODE 파라미터가 "Joystick"(또는 동급) 설정이어야
+하고, 물리적 RC 수신기가 동시에 활성 상태면 우선순위 설정에 따라 이 입력이
+무시될 수 있다 -- 실기에서 잘 안 움직이면 이 파라미터부터 확인할 것.
 """
 from __future__ import annotations
 
@@ -61,6 +71,30 @@ class Px4Link:
     @property
     def latest(self) -> dict[str, Any]:
         return dict(self._latest)
+
+    def send_manual_control(self, pitch: float, roll: float, yaw: float, thr: float) -> None:
+        """조종 입력 1건을 MANUAL_CONTROL로 실제 Pixhawk에 보낸다.
+
+        인자는 전부 -1..1 정규화 값이며, 기존 키보드 시뮬레이션(quadrotor_hud.html)의
+        rcCmd와 부호를 맞췄다 -- 화살표 위(pitch=+1)=전진, 화살표 오른쪽(roll=+1)=우측,
+        D(yaw=+1)=우선회, W(thr=+1)=상승. MAVLink MANUAL_CONTROL의 x/y/r는 -1000..1000,
+        z(스로틀 축)는 이 프로젝트에서 "0 = 중립(호버 근처)"로 취급해 마찬가지로
+        -1000..1000로 보낸다(비행모드에 따라 정확한 해석은 PX4 쪽에 달려 있다).
+
+        ⚠ 실기에서 방향이 반대로 움직이면, 그 축의 부호만 뒤집어서 재확인할 것 --
+        MANUAL_CONTROL 축 부호는 PX4 문서상으로도 100% 고정된 스펙이 아니다.
+        """
+        if self.conn is None:
+            return
+
+        def to_1000(v: float) -> int:
+            return int(max(-1000, min(1000, round(v * 1000))))
+
+        self.conn.mav.manual_control_send(
+            self.conn.target_system,
+            to_1000(pitch), to_1000(roll), to_1000(thr), to_1000(yaw),
+            0,  # buttons -- 사용 안 함
+        )
 
     def poll(self) -> None:
         """대기 중인 MAVLink 메시지를 전부 소진하며 latest 스냅샷을 갱신한다.
