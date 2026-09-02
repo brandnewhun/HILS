@@ -73,6 +73,10 @@ class MatplotlibRenderer(RendererBase):
             0.02, 0.98, "", transform=self.ax.transAxes,
             va="top", ha="left", family="monospace", fontsize=9,
         )
+        self._actuator_text = self.ax.text(
+            0.02, 0.02, "", transform=self.ax.transAxes,
+            va="bottom", ha="left", family="monospace", fontsize=9,
+        )
         self.set_time_of_day(self._time_key)
         self.set_vehicle(vehicle)
 
@@ -147,12 +151,22 @@ class MatplotlibRenderer(RendererBase):
         self._time_key = key
         self.fig.patch.set_facecolor(preset["bg"])
         self._hud_text.set_color(preset["fg"])
+        self._actuator_text.set_color(preset["fg"])
 
     def set_vehicle(self, vehicle: Vehicle) -> None:
         self._craft_patch.set_label(vehicle.label)
 
     def set_target_geometry(self, geometry: dict[str, Any]) -> None:
         pass  # 형상 표현은 현재 삼각형 마커 하나로 통일 -- geometry는 미사용
+
+    def update_actuators(self, actuators: dict[str, Any]) -> None:
+        outs = actuators.get("servo_outputs") or []
+        # PWM(μs) 값을 그대로 보여준다 -- 0이면 그 채널은 아직 신호가 없거나 미사용.
+        pwm_line = "  ".join(f"{i+1}:{v:4d}" for i, v in enumerate(outs) if v)
+        conn = "LINK OK" if actuators.get("connected") else "NO LINK"
+        armed = "ARMED" if actuators.get("armed") else "DISARMED"
+        mode = actuators.get("mode") or "-"
+        self._actuator_text.set_text(f"{conn}  {armed}  MODE:{mode}\nPWM(us)  {pwm_line}")
 
     def update_target_from_state(self, state: dict[str, Any]) -> None:
         self._target_patch.set_visible(bool(state.get("active", False)))

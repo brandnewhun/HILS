@@ -70,3 +70,11 @@ class RendererBase(ABC):
     def update_target_from_state(self, state: dict[str, Any]) -> None:
         """매 프레임, 타겟의 물리 상태(TargetDrone.state)를 위치/자세에 반영.
         state["active"] is False면 메시를 숨긴다."""
+
+    # ---------------------- 실기(live hardware) 액추에이터용 추가 계약 (선택적) ----------------------
+    # 기본 구현은 no-op -- 시뮬레이션만 재생하는 렌더러(액추에이터 출력 자체가 없는 경우)는
+    # 오버라이드하지 않아도 된다. live_vehicle_source.LiveVehicleSource가 이 형식으로
+    # actuators dict를 채운다: {"servo_outputs": [PWM us, ...], "armed": bool,
+    # "mode": str|None, "connected": bool}.
+    def update_actuators(self, actuators: dict[str, Any]) -> None:
+        """매 프레임, 실제 기체(또는 HIL 브릿지)의 액추에이터/암 상태를 HUD에 반영."""
