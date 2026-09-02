@@ -144,6 +144,20 @@
        있게 applyTelemetry()에 훅만 남겨둠.
      ※ 상세 채널 정의는 ICD-PXTR-HILS-001.docx / EICD-PXTR-HILS-001.docx,
        브릿지 쪽 구현은 HILS_ICD/sim/bridge/ 참조.
+     추가(다른 세션) — 실기 액추에이터 표시 + 경량 Python 브릿지 연동:
+     - PX4가 HIL이 아니라 평소(SYS_HITL=0) 모드로 떠서 실제 RC 입력을 받아
+       스스로 자세를 추정하고 액추에이터를 구동하는 상황(HIL_SENSOR 주입도,
+       브릿지의 자체 FDM도 필요 없음)을 위해, sim/bridge/(HIL 폐루프 전용)와는
+       별개로 sim/py/px4_link.py + live_vehicle_source.py + telemetry_ws_server.py
+       + run_live_3d.py를 추가했다. 이쪽은 MAVLink를 "읽기만" 하고, 여기 이
+       HTML이 기대하는 것과 같은 JSON(north/east/alt/roll/pitch/heading/
+       yawRate/vN/vE/climbRate/tilt)에 armed/mode/servoOutputs만 얹어 그대로
+       내보낸다 — 그래서 어느 브릿지를 쓰든 이 HTML은 수정할 필요가 없다.
+     - applyTelemetry()가 이미 pkt 전체를 onTelemetry 콜백에 넘겨주고 있어서,
+       armed/mode/servoOutputs는 FlightSim을 안 건드리고 HUD의 콜백에서만
+       추가로 읽어 새 패널(#actuator-panel)에 그대로 찍는다. 이 필드가 없는
+       패킷(기존 HIL 브릿지)에서는 패널이 계속 숨겨진 채로 있어 기존 화면과
+       동일하게 동작한다.
 
  유지보수 메모
  --------------------------------------------------------------
@@ -362,6 +376,15 @@
       <div class="label">Local NED (m)</div>
       <div class="value mono">N <span id="pos-n">0.0</span> &nbsp; E <span id="pos-e">0.0</span></div>
       <div class="icd-tag">LOCAL_POSITION_NED</div>
+    </div>
+
+    <!-- 실기 액추에이터 출력 패널 — HIL_SENSOR 진실값이 아니라 브릿지가 그대로 전달하는
+         SERVO_OUTPUT_RAW(PWM)와 ARMED/MODE. 시뮬레이션 물리(state/target)와는 무관한
+         "그대로 표시"용이라 telAccum 샘플-홀드를 안 거치고 텔레메트리 도착 즉시 갱신한다. -->
+    <div class="pos-readout panel" id="actuator-panel" style="display:none">
+      <div class="label">Actuators</div>
+      <div class="value mono" id="actuator-status" style="font-size:12px">--</div>
+      <div class="icd-tag">SERVO_OUTPUT_RAW &middot; PWM(&micro;s)</div>
     </div>
 
     <!-- 타겟 드론 패널 — 형상/조종모드 선택 + 재배치. TargetDrone 모듈(스크립트 하단)만 건드리면 됨. -->
@@ -1684,6 +1707,8 @@ var TERRAIN_DATA = {"meta":{"lat":37.27908611111111,"lon":127.10344722222221,"or
     var posE = document.getElementById("pos-e");
     var rcDotEl = document.getElementById("rc-dot");
     var bridgeTextEl = document.getElementById("bridge-text");
+    var actuatorPanel = document.getElementById("actuator-panel");
+    var actuatorStatusEl = document.getElementById("actuator-status");
 
     // FCC(OFP)의 실제 상태(state)는 매 프레임 연속으로 갱신되지만, HUD(VIS/SIM PC)로
     // 나가는 텔레메트리는 ICD 9.4절이 규정한 채널별 전송 주기로만 갱신되는
@@ -1742,12 +1767,28 @@ var TERRAIN_DATA = {"meta":{"lat":37.27908611111111,"lon":127.10344722222221,"or
     // Channel C 패킷이 브릿지에서 도착할 때마다 점멸 — v1의 "RC 샘플링" 표시를
     // "텔레메트리 수신" 표시로 재활용한다. BridgeLink는 이 IIFE보다 먼저 선언·초기화
     // 되므로(스크립트 순서상 FlightSim 바로 다음) 여기서 바로 참조해도 안전하다.
-    Sim.setOnTelemetry(function(){
+    // pkt.servoOutputs/armed/mode는 ICD 물리 상태(state/target)가 아니라 브릿지가 실기에서
+    // 읽은 값을 그대로 전달하는 부가 필드다 — HIL 폐루프 브릿지(bridge/main.py)는 이 필드를
+    // 안 보내므로, 없으면 패널을 계속 숨겨둔다(그 브릿지를 쓸 때는 기존 화면 그대로 동작).
+    function updateActuatorPanel(pkt){
+      var outs = pkt && pkt.servoOutputs;
+      if (!outs || !outs.length) return;
+      if (actuatorPanel) actuatorPanel.style.display = "";
+      if (actuatorStatusEl){
+        var pwm = outs.map(function(v, i){ return v ? (i+1) + ":" + v : null; }).filter(Boolean).join("  ");
+        var armed = pkt.armed ? "ARMED" : "DISARMED";
+        var mode = pkt.mode || "-";
+        actuatorStatusEl.innerHTML = armed + " &middot; " + mode + "<br>" + pwm;
+      }
+    }
+
+    Sim.setOnTelemetry(function(pkt){
       if (rcDotEl && BridgeLink.status === "open"){
         rcDotEl.classList.remove("down");
         rcDotEl.classList.add("on");
         setTimeout(function(){ rcDotEl.classList.remove("on"); }, 70);
       }
+      updateActuatorPanel(pkt);
     });
     setVehicleLabel(Sim.vehicle);
 
