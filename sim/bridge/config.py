@@ -31,6 +31,12 @@ RATES_HZ = {
                        # ICD_RATE.D01_RC와 동일한 10Hz(ICD-PXTR-HILS-001 9.4절)
 }
 
+# PX4에 키보드 조종값을 넣는 MAVLink 메시지 형식.
+# 이전에 PX6C에서 검증된 MANUAL_CONTROL(joystick) 경로를 기본값으로 사용한다.
+# RC_CHANNELS_OVERRIDE는 OFP 구성에 따라 무시될 수 있으므로, 그 경로를 검증할
+# 목적일 때에만 "rc_override"로 바꾼다.
+CONTROL_INPUT_PROTOCOL = "manual_control"  # "manual_control" | "rc_override"
+
 # ── Channel D (ENV→FCC, 조종기 입력) 소스 선택 — rc_source.create_rc_source()가 이 값
 # 하나로 소스를 고른다. main.py나 mavlink_link.py는 손댈 필요 없음(rc_source.py 참조).
 #   "manual"          — 코드/콘솔에서 직접 값을 넣는 최소 구현

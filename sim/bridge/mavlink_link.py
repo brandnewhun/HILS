@@ -86,6 +86,8 @@ class MavlinkLink:
         # Channel B(FCC->ENV) 최신값 캐시 — recv_loop()가 갱신하고 main.py가 읽어간다.
         self.latest_actuator = {
             "motors": [0.0, 0.0, 0.0, 0.0],
+            "all_controls": [0.0] * 16,
+            "flags": 0,
             "tilt_setpoint": 0.0,
             "time_usec": 0,
             "received": False,
@@ -97,6 +99,7 @@ class MavlinkLink:
         # 등을 구분), 그리고 PX4가 보낸 STATUSTEXT/COMMAND_ACK의 최근 기록.
         self.msg_counts = {}
         self.tx_counts = {}
+        self.last_manual_control = None
 
         # 진단용 — PX4가 SYS_STATUS로 보고하는 센서별 present/enabled/health,
         # 그리고 PX4가 되돌려주는 HIGHRES_IMU 최신값(우리가 주입한 값이 실제로
@@ -284,6 +287,21 @@ class MavlinkLink:
             chan6_raw=ignore, chan7_raw=ignore, chan8_raw=ignore,
         )
 
+    def send_manual_control(self, rc_values):
+        """브라우저의 -1..1 입력을 PX4 joystick(MANUAL_CONTROL)으로 송신한다."""
+        def to_1000(key):
+            return int(round(_clamp_unit(rc_values.get(key, 0.0)) * 1000))
+
+        self._count_tx("MANUAL_CONTROL")
+        x, y, z, r = (to_1000("pitch"), to_1000("roll"),
+                       to_1000("thr"), to_1000("yaw"))
+        self.conn.mav.manual_control_send(
+            getattr(self.conn, "target_system", 1) or 1,
+            x, y, z, r,
+            0,
+        )
+        self.last_manual_control = {"x": x, "y": y, "z": z, "r": r}
+
     def send_arm(self, armed):
         """시동/시동해제 명령(MAV_CMD_COMPONENT_ARM_DISARM).
 
@@ -388,6 +406,8 @@ class MavlinkLink:
             elif mtype == "HIL_ACTUATOR_CONTROLS":
                 controls = list(msg.controls)
                 self.latest_actuator["motors"] = controls[0:4]
+                self.latest_actuator["all_controls"] = controls
+                self.latest_actuator["flags"] = getattr(msg, "flags", 0)
                 self.latest_actuator["time_usec"] = msg.time_usec
                 self.latest_actuator["received"] = True
             elif mtype == "HIL_TILT_ACTUATOR_CONTROLS":

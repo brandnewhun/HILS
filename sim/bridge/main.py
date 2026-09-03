@@ -147,12 +147,28 @@ class DebugLogger:
         self._f = open(path, "w", encoding="utf-8")
         self._t0 = time.time()
         self._events_written = 0
+        self._lock = threading.Lock()
+
+    def _write_record(self, rec):
+        """WebSocket 스레드와 main 스레드가 같은 JSONL에 안전하게 기록한다."""
+        with self._lock:
+            self._f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            self._f.flush()
 
     def write_header(self, info):
         """첫 줄에 실행 환경 정보(캘리브레이션 ID 등)를 한 번만 기록."""
         rec = {"t": 0.0, "header": info}
-        self._f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        self._f.flush()
+        self._write_record(rec)
+
+    def record_client_message(self, msg):
+        """브라우저가 보낸 키/RC/ARM 이벤트를 수신 즉시 같은 시간축에 기록한다."""
+        fields = ("type", "action", "key", "browser_ms", "pitch", "roll", "yaw", "thr", "armed")
+        safe_msg = {key: msg[key] for key in fields if key in msg}
+        self._write_record({
+            "t": round(time.time() - self._t0, 3),
+            "kind": "browser_input",
+            "message": safe_msg,
+        })
 
     def write(self, link, rc_values, snap):
         events = list(link.recent_events)
@@ -160,10 +176,14 @@ class DebugLogger:
         self._events_written = len(events)
         rec = {
             "t": round(time.time() - self._t0, 2),
+            "kind": "snapshot",
             "rc": {k: round(v, 3) for k, v in rc_values.items()},
             "armed": bool(link.is_armed()),
             "link_ok": bool(link.fcc_link_ok()),
             "motors": [round(m, 4) for m in link.latest_actuator["motors"]],
+            "actuator_controls": [round(v, 4) for v in link.latest_actuator["all_controls"]],
+            "actuator_flags": link.latest_actuator["flags"],
+            "manual_control": dict(link.last_manual_control) if link.last_manual_control else None,
             "tilt_sp": round(link.latest_actuator["tilt_setpoint"], 4),
             "fdm": {
                 "north": round(snap["north"], 2), "east": round(snap["east"], 2),
@@ -177,8 +197,7 @@ class DebugLogger:
             "hires_imu": dict(link.latest_highres_imu),
             "events": new_events,
         }
-        self._f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        self._f.flush()  # Ctrl+C로 끊어도 지금까지 기록이 남도록
+        self._write_record(rec)  # Ctrl+C로 끊어도 지금까지 기록이 남도록
 
     def close(self):
         try:
@@ -215,7 +234,15 @@ def main():
     dynamics = FlightDynamicsModel(config.FDM)
     rc_source = create_rc_source(config.RC_SOURCE_MODE, config.RC_SOURCE_OPTIONS)
     print("[main] RC 소스: %s" % config.RC_SOURCE_MODE)
+    print("[main] PX4 조종 입력: %s (%.0f Hz)" %
+          (config.CONTROL_INPUT_PROTOCOL, config.RATES_HZ["rc"]))
     shared = SharedState()
+
+    logger = DebugLogger(log_path) if log_path else None
+    if logger:
+        logger.write_header({"cal_ids": cal_ids, "sim_device_ids": SIM_DEVICE_IDS,
+                             "control_input_protocol": config.CONTROL_INPUT_PROTOCOL})
+        print("[main] debug log -> %s" % os.path.abspath(log_path))
 
     # 브라우저 -> 브릿지 방향 메시지 처리. RC_SOURCE_MODE="browser"일 때는 키보드 입력을
     # rc_source로 흘려보내고, ARM/DISARM 요청은 어느 모드에서든 그대로 실기에 전달한다.
@@ -224,6 +251,8 @@ def main():
     arm_requests = queue.Queue()
 
     def on_client_message(msg):
+        if logger:
+            logger.record_client_message(msg)
         mtype = msg.get("type")
         if mtype == "rc" and isinstance(rc_source, BrowserRcSource):
             rc_source.on_message(msg)
@@ -235,11 +264,6 @@ def main():
     hub.start()
     serve_hud_and_open_browser()
 
-    logger = DebugLogger(log_path) if log_path else None
-    if logger:
-        logger.write_header({"cal_ids": cal_ids, "sim_device_ids": SIM_DEVICE_IDS})
-    if logger:
-        print("[main] debug log -> %s" % os.path.abspath(log_path))
     log_next_due = 0.0
 
     period = {k: 1.0 / v for k, v in config.RATES_HZ.items()}
@@ -251,6 +275,15 @@ def main():
     # 250Hz 등은 "목표치"이지 하드 리얼타임 보장은 아니다 — 구조 검증 용도로는 충분하나,
     # 정밀 타이밍이 꼭 필요해지면 이 루프를 별도 스레드+고해상도 타이머로 바꿀 것.
     last_t = time.perf_counter()
+    # ARM 성공 후 일정 시간 뒤 딱 한 번 더 물어볼 질문 예약 시각(초, time.time() 기준).
+    # commander check 등은 ARM "클릭 순간"의 상태만 보여주는데, 실제 궁금한 건 그 뒤
+    # 스로틀을 올렸을 때 PX4 믹서/제어배분(Control Allocation)이 실제로 무엇을
+    # 출력했는가다 — actuator_outputs(최종 PWM/서보 값)와 control_allocator status
+    # (제어효과 행렬 및 출력 채널이 실제로 어떤 함수(모터/서보)에 매핑됐는지)를 보면
+    # HIL_ACTUATOR_CONTROLS.controls[0:4](=우리가 "motors"로 읽는 자리)가 계속 0인 게
+    # "아직 안 밟아서"인지 "이 커스텀 틸트로터 믹서에서 모터가 애초에 다른 채널
+    # 번호에 있어서"인지 구분할 수 있다.
+    pending_probe_at = None
     print("[main] 메인 루프 시작 (Ctrl+C로 종료)")
     try:
         while True:
@@ -277,6 +310,13 @@ def main():
                         #     지금 남은 건 mag/baro의 STALE TIMEOUT 뿐이라 이 둘을 본다.
                         for probe in ("commander check", "listener sensor_mag", "listener sensor_baro"):
                             link.send_shell_cmd(probe)
+                        # 3초 뒤(그 사이 사용자가 스로틀을 밟을 시간) 믹서 출력을 확인.
+                        pending_probe_at = time.time() + 3.0
+
+                if pending_probe_at is not None and time.time() >= pending_probe_at:
+                    pending_probe_at = None
+                    for probe in ("listener actuator_outputs", "control_allocator status"):
+                        link.send_shell_cmd(probe)
 
                 motors = link.latest_actuator["motors"]
                 tilt_sp = link.latest_actuator["tilt_setpoint"]
@@ -296,7 +336,17 @@ def main():
                         elif key == "tilt_state":
                             link.send_hil_tilt_state(snap)
                         elif key == "rc":
-                            link.send_rc_override(rc_source.read())
+                            rc_values = rc_source.read()
+                            if config.CONTROL_INPUT_PROTOCOL == "manual_control":
+                                link.send_manual_control(rc_values)
+                            elif config.CONTROL_INPUT_PROTOCOL == "rc_override":
+                                link.send_rc_override(rc_values)
+                            else:
+                                raise ValueError(
+                                    "알 수 없는 CONTROL_INPUT_PROTOCOL: %r "
+                                    "(manual_control/rc_override 중 하나)" %
+                                    config.CONTROL_INPUT_PROTOCOL
+                                )
 
                 shared.update(build_vis_payload(
                     snap,
