@@ -86,6 +86,23 @@ FDM = {
     "ground_alt_m": 0.0,             # 브릿지 FDM은 평지 가정(실 지형은 브라우저 WorldModel에만 있음)
 }
 
+# ── HIL_SENSOR 주입값에 더할 가우시안 노이즈(표준편차, 각 축 독립) ─────────────
+# FDM은 완벽한 수식값을 만들지만, 실제 센서는 항상 잡음이 섞인다. 여기 시그마를
+# 전부 0으로 두면 정지 상태에서 mag/baro 값이 연속으로 완전히 동일해지고, PX4
+# DataValidator(firmware: src/modules/sensors/data_validator/DataValidator.cpp)가
+# "같은 값이 VALUE_EQUAL_COUNT_DEFAULT(=100)번 연속"이면 고장난(stuck) 센서로
+# 보고 ERROR_FLAG_STALE_DATA를 세운다 -> MAG/BARO STALE -> Arming denied.
+# accel/gyro는 HIL에서 failover 보고 자체가 꺼져 있어(voted_sensors_update.cpp
+# `&& !_hil_enabled`) 당장은 안 걸리지만, EKF 안정성을 위해 함께 넣는다.
+# 시그마는 PX4 EKF2 기본 기대 잡음(EKF2_{ACC,GYR,MAG,BARO}_NOISE)보다 한참 작게
+# 잡아 추정 성능에는 영향이 없고 "완전 동일값"만 깨도록 한다.
+SENSOR_NOISE = {
+    "accel_mss": 0.02,     # m/s^2 (EKF2_ACC_NOISE 기본 0.35의 ~6%)
+    "gyro_rads": 0.002,    # rad/s (EKF2_GYR_NOISE 기본 0.015의 ~13%)
+    "mag_gauss": 0.002,    # gauss (지자기 크기 ~0.53G의 ~0.4%)
+    "baro_hpa": 0.02,      # hPa (EKF2_BARO_NOISE 기본 3.5m 상당보다 훨씬 작음)
+}
+
 # 커스텀 MAVLink 메시지(HIL_TILT_STATE / HIL_TILT_ACTUATOR_CONTROLS)는 표준
 # common.xml에 없다. 실제 PX4 커스텀 펌웨어 저장소의 메시지 정의(XML)를 mavgen으로
 # 생성해 mavlink_link.py에 연결하기 전까지는 비활성화 — 그동안 tilt는 항상 0(수직/MC)

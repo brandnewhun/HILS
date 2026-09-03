@@ -15,6 +15,7 @@ dialect에 없다. config.CUSTOM_TILT_DIALECT_ENABLED가 True인데 실제 pymav
 import collections
 import inspect
 import math
+import random
 import time
 
 import geo
@@ -152,6 +153,7 @@ class MavlinkLink:
         c = self.config
         time_usec = int(time.time() * 1e6)
         fx, fy, fz = fdm_snapshot["specific_force_body"]
+        gx, gy, gz = fdm_snapshot["p"], fdm_snapshot["q"], fdm_snapshot["r"]
         mx, my, mz = self._mag_body_ned_fixed(
             fdm_snapshot["roll"], fdm_snapshot["pitch"], fdm_snapshot["heading"]
         )
@@ -161,13 +163,29 @@ class MavlinkLink:
         speed = math.hypot(fdm_snapshot["vN"], fdm_snapshot["vE"])
         diff_pressure = 0.5 * 1.225 * speed * speed / 100.0  # 대략치(hPa), [TBD-ADS 센서사양]
 
+        # FDM은 수식 그대로의 "완벽한" 값을 내놓는데, 정지 상태에서는 그게 연속으로
+        # 완전히 동일해져 PX4 DataValidator가 STALE(고장난 센서)로 오판한다
+        # (config.SENSOR_NOISE 주석 및 원인 설명 참조). 실제 센서 잡음 수준의 작은
+        # 가우시안 노이즈를 더해 "항상 조금씩 다른 값"으로 만든다.
+        n = c.SENSOR_NOISE
+        fx += random.gauss(0.0, n["accel_mss"])
+        fy += random.gauss(0.0, n["accel_mss"])
+        fz += random.gauss(0.0, n["accel_mss"])
+        gx += random.gauss(0.0, n["gyro_rads"])
+        gy += random.gauss(0.0, n["gyro_rads"])
+        gz += random.gauss(0.0, n["gyro_rads"])
+        mx += random.gauss(0.0, n["mag_gauss"])
+        my += random.gauss(0.0, n["mag_gauss"])
+        mz += random.gauss(0.0, n["mag_gauss"])
+        abs_pressure += random.gauss(0.0, n["baro_hpa"])
+
         fields_updated = getattr(mavutil.mavlink, "HIL_SENSOR_UPDATED_FLAGS_ALL", 0x1FFF)
 
         _send_filtered(
             self.conn.mav.hil_sensor_send,
             time_usec=time_usec,
             xacc=fx, yacc=fy, zacc=fz,
-            xgyro=fdm_snapshot["p"], ygyro=fdm_snapshot["q"], zgyro=fdm_snapshot["r"],
+            xgyro=gx, ygyro=gy, zgyro=gz,
             xmag=mx, ymag=my, zmag=mz,
             abs_pressure=abs_pressure,
             diff_pressure=diff_pressure,
