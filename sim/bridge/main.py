@@ -16,19 +16,22 @@ HILS 브릿지 진입점 — config.py에서 설정을 읽어 아래 4개 독립
 그 다음 브라우저에서 quadrotor_hud_v2.html을 열면(기본 ws://localhost:8765로 접속)
 "BRIDGE 연결됨" 표시와 함께 텔레메트리가 들어오기 시작한다.
 """
+import http.server
 import json
 import math
 import os
 import queue
+import socketserver
 import sys
 import threading
 import time
+import webbrowser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
 from fdm import FlightDynamicsModel
-from mavlink_link import MavlinkLink
+from mavlink_link import MavlinkLink, SIM_DEVICE_IDS
 from rc_source import BrowserRcSource, ScriptedRcSource, create_rc_source
 from telemetry_hub import TelemetryHub
 
@@ -87,6 +90,45 @@ def connect_with_retry(link, retry_delay_s=3.0):
             time.sleep(retry_delay_s)
 
 
+SIM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # bridge/ -> sim/
+HUD_FILE = "quadrotor_hud_v2.html"
+HTTP_PORT = 8000
+
+
+class _Utf8HtmlHandler(http.server.SimpleHTTPRequestHandler):
+    """SimpleHTTPRequestHandler는 .html에 charset을 안 붙여서 브라우저가 인코딩을
+    추측하다 한글 UI가 깨진다. UTF-8을 명시한다."""
+
+    def guess_type(self, path):
+        ctype = super().guess_type(path)
+        return "text/html; charset=utf-8" if ctype == "text/html" else ctype
+
+    def log_message(self, *args):
+        pass  # 브릿지 콘솔에는 [FCC] 진단 메시지만 보이도록 HTTP 접근 로그는 숨긴다
+
+
+def serve_hud_and_open_browser():
+    """HUD를 로컬 HTTP로 띄우고 브라우저를 연다.
+
+    예전에는 사용자가 quadrotor_hud_v2.html을 직접 file://로 열어야 했는데, 그러면
+    "브릿지는 도는데 화면이 아예 안 뜬다"는 상태가 되기 쉬웠다(브라우저가 접속하지
+    않으면 RC 입력도 영원히 0이라, 조종이 안 되는 원인으로도 이어진다).
+    """
+    try:
+        handler = lambda *a, **kw: _Utf8HtmlHandler(*a, directory=SIM_DIR, **kw)
+        httpd = socketserver.TCPServer(("localhost", HTTP_PORT), handler)
+    except OSError as e:
+        print("[main] HTTP 서버를 못 열었습니다(%s) - 브라우저를 직접 여세요." % e)
+        return
+    threading.Thread(target=httpd.serve_forever, name="hud-http", daemon=True).start()
+    url = "http://localhost:%d/%s?ws=ws://%s:%d" % (HTTP_PORT, HUD_FILE, config.WS_HOST, config.WS_PORT)
+    print("[main] HUD 화면: %s" % url)
+    try:
+        webbrowser.open(url)
+    except Exception:
+        print("[main] 브라우저 자동 실행 실패 - 위 주소를 직접 여세요.")
+
+
 class DebugLogger:
     """진단용 JSONL 로거 — 한 줄에 한 스냅샷. --log 로 켠다.
 
@@ -105,6 +147,12 @@ class DebugLogger:
         self._f = open(path, "w", encoding="utf-8")
         self._t0 = time.time()
         self._events_written = 0
+
+    def write_header(self, info):
+        """첫 줄에 실행 환경 정보(캘리브레이션 ID 등)를 한 번만 기록."""
+        rec = {"t": 0.0, "header": info}
+        self._f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._f.flush()
 
     def write(self, link, rc_values, snap):
         events = list(link.recent_events)
@@ -125,6 +173,8 @@ class DebugLogger:
             },
             "msgs": dict(link.msg_counts),
             "tx": dict(link.tx_counts),
+            "sensors": dict(link.sys_status_sensors),
+            "hires_imu": dict(link.latest_highres_imu),
             "events": new_events,
         }
         self._f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -148,6 +198,20 @@ def main():
     connect_with_retry(link)
     print("[main] 시리얼 포트 오픈 완료 — HIL_ACTUATOR_CONTROLS/HEARTBEAT 대기 중...")
 
+    # 진단 A — PX4가 캘리브레이션에 등록해둔 센서 장치 ID를 읽어, HIL 시뮬레이션 센서의
+    # 장치 ID와 같은지 대조한다. 다르면 PX4는 "등록된 그 센서"가 데이터를 안 준다고 보고
+    # 'No valid data from Accel 0'으로 시동을 거부한다 — 이게 지금 의심 중인 원인.
+    cal_ids = {}
+    print("[main] 센서 캘리브레이션 장치 ID 조회 중...")
+    for pname in ("CAL_ACC0_ID", "CAL_GYRO0_ID", "CAL_MAG0_ID", "CAL_BARO0_ID"):
+        value = link.read_param(pname)
+        cal_ids[pname] = int(value) if value is not None else None
+        print("    %-13s = %s" % (pname, cal_ids[pname]))
+    print("[main] HIL 시뮬레이션 센서가 쓰는 장치 ID(PX4 내부 상수):")
+    for label, dev_id in SIM_DEVICE_IDS.items():
+        match = [k for k, v in cal_ids.items() if v == dev_id]
+        print("    %-34s = %-10d %s" % (label, dev_id, ("<= %s 와 일치" % ",".join(match)) if match else "(일치하는 CAL_*_ID 없음)"))
+
     dynamics = FlightDynamicsModel(config.FDM)
     rc_source = create_rc_source(config.RC_SOURCE_MODE, config.RC_SOURCE_OPTIONS)
     print("[main] RC 소스: %s" % config.RC_SOURCE_MODE)
@@ -169,8 +233,11 @@ def main():
     hub = TelemetryHub(config.WS_HOST, config.WS_PORT, config.WS_BROADCAST_HZ, shared.read,
                        on_client_message=on_client_message)
     hub.start()
+    serve_hud_and_open_browser()
 
     logger = DebugLogger(log_path) if log_path else None
+    if logger:
+        logger.write_header({"cal_ids": cal_ids, "sim_device_ids": SIM_DEVICE_IDS})
     if logger:
         print("[main] debug log -> %s" % os.path.abspath(log_path))
     log_next_due = 0.0

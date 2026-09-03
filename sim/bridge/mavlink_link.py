@@ -33,6 +33,28 @@ _ACK_RESULT_TEXT = {
 }
 
 
+# SYS_STATUS의 onboard_control_sensors_* 비트 — PX4가 "이 센서가 존재하는가/켜져
+# 있는가/정상인가"를 스스로 보고하는 값이다. 시동 거부 원인을 좁힐 때, 우리가 주입한
+# 센서가 PX4 눈에 실제로 어떻게 보이는지 확인하는 용도.
+_SYS_STATUS_SENSOR_BITS = {
+    "gyro": 1 << 0,
+    "accel": 1 << 1,
+    "mag": 1 << 2,
+    "abs_pressure": 1 << 3,
+    "diff_pressure": 1 << 4,
+    "gps": 1 << 5,
+    "ahrs": 1 << 21,
+}
+
+# PX4가 HIL 센서를 등록할 때 쓰는 장치 ID(mavlink_receiver.cpp의 상수).
+# 보드 실물 센서의 ID와 다르므로, CAL_*_ID(캘리브레이션에 등록된 ID)와 비교하면
+# "PX4가 찾는 센서"와 "우리가 주입한 센서"가 같은 물건인지 판별할 수 있다.
+SIM_DEVICE_IDS = {
+    "accel/gyro (DRV_IMU_DEVTYPE_SIM)": 1211382,
+    "mag (DRV_MAG_DEVTYPE_MAGSIM)": 197388,
+}
+
+
 def _clamp_unit(v):
     return max(-1.0, min(1.0, v))
 
@@ -70,6 +92,12 @@ class MavlinkLink:
         # 등을 구분), 그리고 PX4가 보낸 STATUSTEXT/COMMAND_ACK의 최근 기록.
         self.msg_counts = {}
         self.tx_counts = {}
+
+        # 진단용 — PX4가 SYS_STATUS로 보고하는 센서별 present/enabled/health,
+        # 그리고 PX4가 되돌려주는 HIGHRES_IMU 최신값(우리가 주입한 값이 실제로
+        # PX4 내부까지 들어갔는지 대조하기 위함).
+        self.sys_status_sensors = {}
+        self.latest_highres_imu = {}
         self.recent_events = collections.deque(maxlen=40)
 
     def connect(self):
@@ -284,6 +312,32 @@ class MavlinkLink:
                 )
                 continue
 
+            if mtype == "SYS_STATUS":
+                present = getattr(msg, "onboard_control_sensors_present", 0)
+                enabled = getattr(msg, "onboard_control_sensors_enabled", 0)
+                health = getattr(msg, "onboard_control_sensors_health", 0)
+                self.sys_status_sensors = {
+                    name: {
+                        "present": bool(present & bit),
+                        "enabled": bool(enabled & bit),
+                        "health": bool(health & bit),
+                    }
+                    for name, bit in _SYS_STATUS_SENSOR_BITS.items()
+                }
+                continue
+            if mtype == "HIGHRES_IMU":
+                self.latest_highres_imu = {
+                    "xacc": getattr(msg, "xacc", None),
+                    "yacc": getattr(msg, "yacc", None),
+                    "zacc": getattr(msg, "zacc", None),
+                    "xmag": getattr(msg, "xmag", None),
+                    "ymag": getattr(msg, "ymag", None),
+                    "zmag": getattr(msg, "zmag", None),
+                    "abs_pressure": getattr(msg, "abs_pressure", None),
+                    "temperature": getattr(msg, "temperature", None),
+                }
+                continue
+
             if mtype == "HEARTBEAT":
                 # 이 연결은 Pixhawk 1대와의 점대점(serial) 링크이므로, 여기 들어오는
                 # HEARTBEAT는 항상 FCC가 보낸 것이다(수신 쪽에는 우리 자신이 보낸
@@ -307,6 +361,28 @@ class MavlinkLink:
                 self.latest_actuator["tilt_setpoint"] = (sum(angles) / len(angles)) / 90.0 if angles else 0.0
             elif on_telemetry_message is not None:
                 on_telemetry_message(msg)
+
+    def read_param(self, name, timeout=3.0):
+        """파라미터 1개를 읽는다(없거나 응답이 없으면 None).
+
+        진단 목적: CAL_ACC0_ID 등 "PX4가 캘리브레이션에 등록해둔 장치 ID"를 읽어서,
+        우리가 주입한 시뮬레이션 센서의 장치 ID(SIM_DEVICE_IDS)와 비교하기 위함.
+        둘이 다르면 PX4는 "내가 찾는 그 센서가 데이터를 안 준다"고 판단해
+        'No valid data from Accel 0' 로 시동을 거부한다.
+        """
+        self.conn.mav.param_request_read_send(
+            getattr(self.conn, "target_system", 1) or 1,
+            getattr(self.conn, "target_component", 1) or 1,
+            name.encode("ascii"), -1,
+        )
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.conn.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.3)
+            if msg is None:
+                continue
+            if msg.param_id.strip("\x00") == name:
+                return msg.param_value
+        return None
 
     def _count_tx(self, name):
         """ENV -> FCC 송신 건수. 로그에서 '보내긴 했는가'를 '받았는가'와 나눠 보기 위함."""
