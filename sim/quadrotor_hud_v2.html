@@ -1102,15 +1102,20 @@ var TERRAIN_DATA = {"meta":{"lat":37.27908611111111,"lon":127.10344722222221,"or
     window.addEventListener("keydown", function(e){
       if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].indexOf(e.key) !== -1) e.preventDefault();
       keys[e.key.toLowerCase()] = true;
+      Link.send({type:"key", action:"down", key:e.key, browser_ms:Math.round(performance.now())});
     }, {passive:false});
     window.addEventListener("keyup", function(e){
       keys[e.key.toLowerCase()] = false;
+      Link.send({type:"key", action:"up", key:e.key, browser_ms:Math.round(performance.now())});
     });
 
     // 창(탭) 포커스를 잃으면 눌려있던 키 상태가 keyup 없이 그대로 "눌린 채" 남을 수
     // 있다 — 실기를 조종하는 상황에서는 이게 v1(순수 시뮬레이션)보다 훨씬 위험하므로
     // (조종석을 떠난 사이 계속 전진 명령이 나가는 것과 같음) 포커스 이탈 시 전부 놓는다.
-    window.addEventListener("blur", function(){ keys = Object.create(null); });
+    window.addEventListener("blur", function(){
+      keys = Object.create(null);
+      Link.send({type:"key", action:"blur", key:"", browser_ms:Math.round(performance.now())});
+    });
 
     function tick(dt){
       accum += dt;
