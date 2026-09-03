@@ -50,8 +50,12 @@ _SYS_STATUS_SENSOR_BITS = {
 # 보드 실물 센서의 ID와 다르므로, CAL_*_ID(캘리브레이션에 등록된 ID)와 비교하면
 # "PX4가 찾는 센서"와 "우리가 주입한 센서"가 같은 물건인지 판별할 수 있다.
 SIM_DEVICE_IDS = {
-    "accel/gyro (DRV_IMU_DEVTYPE_SIM)": 1211382,
+    # 이 값들은 이 저장소의 PX4 소스(mavlink_receiver.cpp handle_message_hil_sensor)에서
+    # 직접 확인한 것이다. 이전에 1211382로 적어뒀던 accel/gyro 값은 틀렸고, 실기에서
+    # listener sensor_accel로 확인한 실제 device_id는 1310988이었다.
+    "accel/gyro (DRV_IMU_DEVTYPE_SIM)": 1310988,
     "mag (DRV_MAG_DEVTYPE_MAGSIM)": 197388,
+    "baro (DRV_BARO_DEVTYPE_BAROSIM)": 6620172,
 }
 
 
