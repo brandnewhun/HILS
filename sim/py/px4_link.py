@@ -56,6 +56,12 @@ class Px4Link:
         self.baud = baud
         self.conn = None
         self._latest: dict[str, Any] = _new_snapshot()
+        # 진단용: 실제로 어떤 MAVLink 메시지가 몇 건 도착했는지 종류별 누적 카운트.
+        # "LOCAL_POSITION_NED가 아예 안 오는 건지"처럼, 값이 0인 이유가 '못 받아서'인지
+        # '받았는데 0인지'를 구분하는 데 쓴다.
+        self.msg_counts: dict[str, int] = {}
+        # 진단용: 마지막으로 실제 송신한 MANUAL_CONTROL 값(변환된 정수).
+        self.last_manual_control: dict[str, int] | None = None
 
     def connect(self, heartbeat_timeout: float = 10.0) -> None:
         self.conn = mavutil.mavlink_connection(self.connection_string, baud=self.baud)
@@ -90,11 +96,12 @@ class Px4Link:
         def to_1000(v: float) -> int:
             return int(max(-1000, min(1000, round(v * 1000))))
 
+        x, y, z, r = to_1000(pitch), to_1000(roll), to_1000(thr), to_1000(yaw)
         self.conn.mav.manual_control_send(
-            self.conn.target_system,
-            to_1000(pitch), to_1000(roll), to_1000(thr), to_1000(yaw),
+            self.conn.target_system, x, y, z, r,
             0,  # buttons -- 사용 안 함
         )
+        self.last_manual_control = {"x": x, "y": y, "z": z, "r": r}
 
     def poll(self) -> None:
         """대기 중인 MAVLink 메시지를 전부 소진하며 latest 스냅샷을 갱신한다.
@@ -111,6 +118,7 @@ class Px4Link:
         t = msg.get_type()
         latest = self._latest
         latest["last_update_s"] = time.time()
+        self.msg_counts[t] = self.msg_counts.get(t, 0) + 1
 
         if t == "HEARTBEAT":
             latest["armed"] = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)

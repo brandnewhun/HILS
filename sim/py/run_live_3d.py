@@ -30,11 +30,17 @@ PX4가 이 조종 입력을 받아들이려면 COM_RC_IN_MODE가 "Joystick"(또�
 
     python run_live_3d.py COM11
     python run_live_3d.py /dev/ttyACM0
+    python run_live_3d.py COM11 --log debug.jsonl   # 진단 로그까지 남기기
+
+--log를 주면 "브라우저가 보낸 조종 입력 / 실기로 실제 보낸 MANUAL_CONTROL / 실기가
+돌려준 텔레메트리 / MAVLink 메시지 종류별 수신 건수"를 한 파일에 시간순으로 기록한다.
+브라우저 쪽을 따로 캡처할 필요 없이 이 파일 하나만 보면 어느 구간이 끊겼는지 알 수 있다.
 """
 from __future__ import annotations
 
 import argparse
 import http.server
+import json
 import os
 import socketserver
 import sys
@@ -56,6 +62,7 @@ HTTP_PORT = 8000
 POLL_HZ = 60.0
 BROADCAST_HZ = 30.0
 RC_SEND_HZ = 10.0  # ICD D-01(RC_CHANNELS) 채널과 동일한 샘플-홀드 주기(Hz)
+LOG_HZ = 5.0       # --log 진단 기록 주기(Hz) -- 사람이 눈으로 훑기 좋은 정도
 
 
 class SharedState:
@@ -107,6 +114,57 @@ class RcInputState:
             return dict(self._rc)
 
 
+class DebugLogger:
+    """진단용 JSONL 로거 -- 한 줄에 한 스냅샷씩 기록한다.
+
+    이 프로세스는 양쪽 데이터를 다 갖고 있다(브라우저가 보낸 RC 입력 + Pixhawk가 보낸
+    텔레메트리). 그래서 브라우저 콘솔을 따로 캡처할 필요 없이 여기 한 파일만 보면
+    "입력이 들어왔는지 / 실기로 보냈는지 / 실기가 뭘 돌려줬는지"를 시간순으로 대조할 수
+    있다. 특히 msgs(메시지 종류별 누적 카운트)를 보면 LOCAL_POSITION_NED처럼 아예 안
+    오는 메시지가 있는지 바로 드러난다.
+
+    기록 형식(한 줄 = JSON 1개):
+      t     : 시작 후 경과 시간(s)
+      rc_in : 브라우저에서 마지막으로 받은 조종 입력(-1..1)
+      mc    : 실제로 실기에 보낸 MANUAL_CONTROL 정수값(x/y/z/r), 아직 안 보냈으면 null
+      tlm   : 실기가 돌려준 값(자세/위치/액추에이터/armed/mode)
+      msgs  : MAVLink 메시지 종류별 누적 수신 건수
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._f = open(path, "w", encoding="utf-8")
+        self._t0 = time.time()
+
+    def write(self, rc_in: dict, link: Px4Link, source: LiveVehicleSource) -> None:
+        latest = link.latest
+        rec = {
+            "t": round(time.time() - self._t0, 2),
+            "rc_in": rc_in,
+            "mc": link.last_manual_control,
+            "tlm": {
+                "roll": round(latest["roll"], 4),
+                "pitch": round(latest["pitch"], 4),
+                "yaw": round(latest["yaw"], 4),
+                "north": round(latest["north"], 3),
+                "east": round(latest["east"], 3),
+                "alt": round(latest["alt"], 3),
+                "armed": latest["armed"],
+                "mode": latest["mode"],
+                "servo": latest["servo_outputs"],
+            },
+            "msgs": dict(link.msg_counts),
+        }
+        self._f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._f.flush()  # 도중에 Ctrl+C로 끊어도 지금까지 기록이 남도록 매번 flush
+
+    def close(self) -> None:
+        try:
+            self._f.close()
+        except Exception:
+            pass
+
+
 class _Utf8HtmlHandler(http.server.SimpleHTTPRequestHandler):
     """SimpleHTTPRequestHandler는 .html에 'text/html'만 보내고 charset을 안 붙인다 --
     브라우저가 인코딩을 추측하다 quadrotor_hud_v2.html의 한글 UI 텍스트가 깨진다.
@@ -127,7 +185,7 @@ def start_static_http_server(directory: str, port: int) -> None:
     print(f"[run_live_3d] 정적 파일 서버 시작: http://localhost:{port}/ (문서 루트: {directory})")
 
 
-def run(connection_string: str, baud: int) -> None:
+def run(connection_string: str, baud: int, log_path: str | None = None) -> None:
     link = Px4Link(connection_string, baud=baud)
     print(f"[run_live_3d] Pixhawk 연결 시도: {connection_string} (baud={baud})")
     link.connect()
@@ -147,9 +205,17 @@ def run(connection_string: str, baud: int) -> None:
     print(f"[run_live_3d] 브라우저를 엽니다: {url}")
     webbrowser.open(url)
 
+    logger = None
+    if log_path:
+        logger = DebugLogger(log_path)
+        print(f"[run_live_3d] 진단 로그 기록 중: {os.path.abspath(log_path)}")
+
     period = 1.0 / POLL_HZ
     rc_period = 1.0 / RC_SEND_HZ
+    log_period = 1.0 / LOG_HZ
     rc_accum = 0.0
+    log_accum = 0.0
+    rc = {"pitch": 0.0, "roll": 0.0, "yaw": 0.0, "thr": 0.0}
     print("[run_live_3d] 폴링 루프 시작 -- 브라우저 키보드 입력이 실기로 전송됩니다 (Ctrl+C로 종료)")
     try:
         while True:
@@ -163,10 +229,19 @@ def run(connection_string: str, baud: int) -> None:
                 rc = rc_input.read()
                 link.send_manual_control(rc["pitch"], rc["roll"], rc["yaw"], rc["thr"])
 
+            if logger is not None:
+                log_accum += period
+                if log_accum >= log_period:
+                    log_accum -= log_period
+                    logger.write(rc, link, source)
+
             time.sleep(max(0.0, period - (time.perf_counter() - t0)))
     except KeyboardInterrupt:
         print("\n[run_live_3d] 종료합니다.")
     finally:
+        if logger is not None:
+            logger.close()
+            print(f"[run_live_3d] 로그 저장 완료: {os.path.abspath(log_path)}")
         link.close()
 
 
@@ -174,8 +249,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("connection", help="예: COM11, /dev/ttyACM0, udp:127.0.0.1:14540")
     parser.add_argument("--baud", type=int, default=115200, help="USB 직결이면 무시됨(native 속도)")
+    parser.add_argument("--log", metavar="PATH", default=None,
+                         help="진단용 JSONL 로그 파일 경로 (예: --log debug.jsonl). "
+                              "브라우저 입력/실기 송신값/실기 회신값/MAVLink 메시지 카운트를 "
+                              "한 파일에 시간순으로 기록한다.")
     args = parser.parse_args()
-    run(args.connection, args.baud)
+    run(args.connection, args.baud, args.log)
 
 
 if __name__ == "__main__":
