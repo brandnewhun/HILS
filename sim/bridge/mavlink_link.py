@@ -510,12 +510,22 @@ class MavlinkLink:
     def sim_motors(self, source_mode):
         """FDM이 사용할 모터 벡터를 선택한다.
 
-        ``nsh_actuator_motors``는 OFP 수정 전의 임시 검증 경로다. 새 uORB 스냅샷이
-        1초 이상 안 들어오면 안전하게 0을 반환해 오래된 추력이 남지 않게 한다.
+        ``nsh_actuator_motors``는 OFP 수정 전의 임시 검증 경로다. ``listener
+        actuator_motors``가 읽는 값은 자세제어기가 "지금 이 자세라면 이렇게
+        출력하겠다"고 계속 계산하는 내부 제어 노력값이라, PX4 자신의 arm
+        상태와 무관하게 항상 갱신된다(TERMINATION/디스암 상태에서 이 값이
+        계속 흔들리는 게 실측으로 확인됨). 최종 실물 출력(actuator_outputs)은
+        PX4가 알아서 armed일 때만 내보내지만, 우리는 그 안전 게이트를 우회해서
+        읽는 셈이므로 여기서 반드시 직접 armed를 확인해야 한다 — 안 그러면
+        DISARM 상태에서도 FDM이 계속 움직이는 버그가 된다(실제로 발생했었음).
+        새 uORB 스냅샷이 1초 이상 안 들어오면 안전하게 0을 반환해 오래된
+        추력이 남지 않게 한다.
         """
         if source_mode == "hil_controls":
             return list(self.latest_actuator["motors"])
         if source_mode == "nsh_actuator_motors":
+            if not self.is_armed():
+                return [0.0, 0.0, 0.0, 0.0]
             if time.time() - self.latest_ofp_motors["updated_s"] <= 1.0:
                 return list(self.latest_ofp_motors["motors"])
             return [0.0, 0.0, 0.0, 0.0]
