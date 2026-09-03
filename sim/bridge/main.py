@@ -269,6 +269,12 @@ def main():
                     want_armed = arm_requests.get_nowait()
                     print("[main] ARM 요청: %s" % ("ARM" if want_armed else "DISARM"))
                     link.send_arm(want_armed)
+                    if want_armed:
+                        # ARM을 시도하는 바로 그 순간 PX4가 sensor_accel을 어떻게 보고
+                        # 있는지 NSH로 직접 확인한다 -- "몇 초 전 데이터인지"가 여기서만
+                        # 확정적으로 드러난다(브릿지를 끄고 따로 확인하면 당연히 오래된
+                        # 값만 보이므로 이 순간에 물어야 의미가 있다).
+                        link.send_shell_cmd("listener sensor_accel")
 
                 motors = link.latest_actuator["motors"]
                 tilt_sp = link.latest_actuator["tilt_setpoint"]

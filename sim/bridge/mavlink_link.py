@@ -98,6 +98,7 @@ class MavlinkLink:
         # PX4 내부까지 들어갔는지 대조하기 위함).
         self.sys_status_sensors = {}
         self.latest_highres_imu = {}
+        self._shell_buffer = ""
         self.recent_events = collections.deque(maxlen=40)
 
     def connect(self):
@@ -304,6 +305,18 @@ class MavlinkLink:
                 if text:
                     self._record_event("STATUSTEXT[sev=%s] %s" % (getattr(msg, "severity", "?"), text))
                 continue
+            if mtype == "SERIAL_CONTROL":
+                # NSH 셸 응답 조각 -- send_shell_cmd()로 보낸 명령의 출력이 여러 조각으로
+                # 쪼개져 돌아온다. 줄 단위로 모아서 완성된 줄만 이벤트로 남긴다.
+                n = getattr(msg, "count", 0)
+                text = bytes(msg.data[:n]).decode("utf-8", "replace")
+                self._shell_buffer += text
+                while "\n" in self._shell_buffer:
+                    line, self._shell_buffer = self._shell_buffer.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        self._record_event("NSH: %s" % line)
+                continue
             if mtype == "COMMAND_ACK":
                 result = getattr(msg, "result", None)
                 self._record_event(
@@ -361,6 +374,24 @@ class MavlinkLink:
                 self.latest_actuator["tilt_setpoint"] = (sum(angles) / len(angles)) / 90.0 if angles else 0.0
             elif on_telemetry_message is not None:
                 on_telemetry_message(msg)
+
+    def send_shell_cmd(self, text):
+        """QGC의 "MAVLink Console"과 같은 프로토콜(SERIAL_CONTROL_DEV_SHELL)로 NSH에
+        명령 1건을 보낸다 — sim/py/mavlink_shell.py와 동일 구현. 응답은 이 함수가 직접
+        기다리지 않는다(넌블로킹) — poll_incoming()이 다른 메시지들처럼 그때그때
+        받아서 recent_events에 쌓아준다(SERIAL_CONTROL 처리 참조)."""
+        from pymavlink import mavutil
+        dev_shell = mavutil.mavlink.SERIAL_CONTROL_DEV_SHELL
+        flags = (
+            mavutil.mavlink.SERIAL_CONTROL_FLAG_RESPOND
+            | mavutil.mavlink.SERIAL_CONTROL_FLAG_EXCLUSIVE
+            | mavutil.mavlink.SERIAL_CONTROL_FLAG_MULTI
+        )
+        data = (text + "\n").encode("ascii", "replace")
+        for i in range(0, len(data), 70):
+            chunk = data[i:i + 70]
+            padded = chunk + b"\x00" * (70 - len(chunk))
+            self.conn.mav.serial_control_send(dev_shell, flags, 0, 0, len(chunk), list(padded))
 
     def read_param(self, name, timeout=3.0):
         """파라미터 1개를 읽는다(없거나 응답이 없으면 None).
