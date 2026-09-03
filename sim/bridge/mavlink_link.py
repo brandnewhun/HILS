@@ -69,6 +69,7 @@ class MavlinkLink:
         # 진단용 — 어떤 메시지가 몇 건 들어왔는지(HIL_ACTUATOR_CONTROLS가 아예 안 오는지
         # 등을 구분), 그리고 PX4가 보낸 STATUSTEXT/COMMAND_ACK의 최근 기록.
         self.msg_counts = {}
+        self.tx_counts = {}
         self.recent_events = collections.deque(maxlen=40)
 
     def connect(self):
@@ -85,6 +86,7 @@ class MavlinkLink:
     # ── Channel A: ENV -> FCC (송신) ──────────────────────────────────────────
     def send_heartbeat(self):
         from pymavlink import mavutil
+        self._count_tx("HEARTBEAT")
         self.conn.mav.heartbeat_send(
             type=mavutil.mavlink.MAV_TYPE_GCS,
             autopilot=mavutil.mavlink.MAV_AUTOPILOT_INVALID,
@@ -113,6 +115,7 @@ class MavlinkLink:
 
     def send_hil_sensor(self, fdm_snapshot):
         from pymavlink import mavutil
+        self._count_tx("HIL_SENSOR")
         c = self.config
         time_usec = int(time.time() * 1e6)
         fx, fy, fz = fdm_snapshot["specific_force_body"]
@@ -142,6 +145,7 @@ class MavlinkLink:
         )
 
     def send_hil_gps(self, fdm_snapshot):
+        self._count_tx("HIL_GPS")
         c = self.config
         time_usec = int(time.time() * 1e6)
         lat, lon = geo.ned_to_latlon(
@@ -216,6 +220,7 @@ class MavlinkLink:
         return int(max(1000, min(2000, center + _clamp_unit(value) * span)))
 
     def send_rc_override(self, rc_values):
+        self._count_tx("RC_CHANNELS_OVERRIDE")
         ignore = self.RC_CHANNEL_IGNORE
         self.conn.mav.rc_channels_override_send(
             target_system=getattr(self.conn, "target_system", 1) or 1,
@@ -238,6 +243,7 @@ class MavlinkLink:
         """
         from pymavlink import mavutil  # 이 파일의 다른 메서드들과 같은 지역 import 관례
 
+        self._count_tx("ARM_CMD")
         self.conn.mav.command_long_send(
             getattr(self.conn, "target_system", 1) or 1,
             getattr(self.conn, "target_component", 1) or 1,
@@ -301,6 +307,10 @@ class MavlinkLink:
                 self.latest_actuator["tilt_setpoint"] = (sum(angles) / len(angles)) / 90.0 if angles else 0.0
             elif on_telemetry_message is not None:
                 on_telemetry_message(msg)
+
+    def _count_tx(self, name):
+        """ENV -> FCC 송신 건수. 로그에서 '보내긴 했는가'를 '받았는가'와 나눠 보기 위함."""
+        self.tx_counts[name] = self.tx_counts.get(name, 0) + 1
 
     def _record_event(self, text):
         """PX4가 보낸 진단 메시지를 콘솔에 즉시 찍고, --log용으로도 남겨둔다.

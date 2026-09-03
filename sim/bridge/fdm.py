@@ -99,7 +99,6 @@ class FlightDynamicsModel:
         thrust_n = thrust_mix * 4.0 * self.max_thrust_motor
         s, c_ = math.sin(self.tilt * math.pi / 2.0), math.cos(self.tilt * math.pi / 2.0)
         thrust_body = (thrust_n * s / self.mass, 0.0, -thrust_n * c_ / self.mass)
-        self._last_specific_force = thrust_body
 
         cr, sr = math.cos(self.roll), math.sin(self.roll)
         cp, sp = math.cos(self.pitch), math.sin(self.pitch)
@@ -129,6 +128,32 @@ class FlightDynamicsModel:
             self.pos_d = floor_d
             if self.vd > 0:
                 self.vd = 0.0
+
+        # ── 가속도계가 읽는 값(specific force = 비중력 가속) ─────────────────────
+        # 예전에는 추력만 그대로 넣었는데, 그러면 지면에 앉아 시동도 안 건 기체가
+        # (0,0,0) = "자유낙하 중"을 계속 보고하게 된다. 실제 가속도계는 정지 상태에서
+        # 중력 반작용 약 1g를 읽으므로, PX4는 그 값을 물리적으로 불가능하다고 보고
+        # "Preflight Fail: No valid data from Accel 0"으로 시동을 거부한다.
+        #
+        # 정의대로 "실제 가속 - 중력"을 body 좌표로 변환해서 넣는다:
+        #   지면 정지  -> (0,0,-g)      = 1g (정상)
+        #   정지 호버  -> (0,0,-g)      = 1g (추력이 중력을 상쇄하므로 실제 가속 0)
+        #   자유낙하   -> (0,0,0)       = 0g
+        on_ground = (self.pos_d >= floor_d - 1e-9) and (ad >= 0.0)
+        if on_ground:
+            # 지면 반력/마찰이 받쳐주므로 실제 가속은 0 — 미끄러지지 않게 속도도 정지.
+            self.vn = self.ve = self.vd = 0.0
+            a_n = a_e = a_d = 0.0
+        else:
+            a_n, a_e, a_d = an, ae, ad
+
+        sf_n, sf_e, sf_d = a_n, a_e, a_d - self.g
+        # NED -> body(FRD)는 body->NED 회전행렬의 전치.
+        self._last_specific_force = (
+            r11 * sf_n + r21 * sf_e + r31 * sf_d,
+            r12 * sf_n + r22 * sf_e + r32 * sf_d,
+            r13 * sf_n + r23 * sf_e + r33 * sf_d,
+        )
 
     def snapshot(self):
         """mavlink_link.py(HIL_SENSOR/HIL_GPS 생성)와 telemetry_hub.py(브라우저 전송)가

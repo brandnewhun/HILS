@@ -124,6 +124,7 @@ class DebugLogger:
                 "heading": round(snap["heading"], 3),
             },
             "msgs": dict(link.msg_counts),
+            "tx": dict(link.tx_counts),
             "events": new_events,
         }
         self._f.write(json.dumps(rec, ensure_ascii=False) + "\n")
