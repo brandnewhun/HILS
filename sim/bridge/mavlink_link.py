@@ -317,6 +317,41 @@ class MavlinkLink:
         )
         self.last_manual_control = {"x": x, "y": y, "z": z, "r": r}
 
+    # PX4 custom_mode 인코딩(펌웨어 src/modules/commander/px4_custom_mode.h의
+    # union px4_custom_mode: uint16 reserved, uint8 main_mode, uint8 sub_mode를
+    # little-endian uint32로 읽으면 main_mode가 16비트 왼쪽 시프트된 자리에 옴).
+    # PX4_CUSTOM_MAIN_MODE_MANUAL=1 -> 1 << 16 = 65536. QGC/MAVSDK 예제에서
+    # "Manual 모드 = custom_mode 65536"으로 자주 보이는 그 상수와 동일하다.
+    PX4_CUSTOM_MODE_MANUAL = 1 << 16
+
+    def send_set_manual_mode(self):
+        """MANUAL 비행모드로 전환한다(MAV_CMD_DO_SET_MODE).
+
+        이 기체 전용 자세제어 모듈(tv_att_control/TiltVtolAttitudeControl.cpp)은
+        ``vehicle_status.nav_state == NAVIGATION_STATE_MANUAL``일 때만 스틱
+        스로틀(``manual_control_setpoint.throttle``)을 그대로 추력 명령으로
+        쓴다 — 그 외 모드에서는 위치/자세 컨트롤러가 계산한
+        ``vehicle_attitude_setpoint.thrust_body[2]``를 쓰는데, 이건 유효한
+        위치/속도 추정치가 있어야 의미 있는 값을 낸다. 실기 로그에서 스로틀을
+        끝까지 눌러도 모터가 노이즈 수준(<0.001)에서 안 움직인 게 이 경로 때문
+        이었다 — 정작 그 순간 "velocity/position estimate error"가 계속
+        떠 있었다. MANUAL 모드로 두면 이 EKF 의존성을 완전히 우회해 스틱이
+        바로 반영된다(HIL 배선 자체를 검증하려는 지금 목적에 맞음). OFP는
+        안 건드림 — 브릿지가 시작 시 한 번, ARM 요청 때마다 한 번씩 요청만
+        보낸다(다른 프로세스가 모드를 바꿔도 곧 다시 맞춰짐).
+        """
+        from pymavlink import mavutil
+        self._count_tx("SET_MODE")
+        self.conn.mav.command_long_send(
+            getattr(self.conn, "target_system", 1) or 1,
+            getattr(self.conn, "target_component", 1) or 1,
+            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+            0,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            self.PX4_CUSTOM_MODE_MANUAL,
+            0, 0, 0, 0, 0,
+        )
+
     def send_arm(self, armed):
         """시동/시동해제 명령(MAV_CMD_COMPONENT_ARM_DISARM).
 

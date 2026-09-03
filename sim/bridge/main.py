@@ -219,6 +219,12 @@ def main():
     connect_with_retry(link)
     print("[main] 시리얼 포트 오픈 완료 — HIL_ACTUATOR_CONTROLS/HEARTBEAT 대기 중...")
 
+    # 진단 B — MANUAL 비행모드로 전환해 둔다. 이 기체 전용 tv_att_control이
+    # NAVIGATION_STATE_MANUAL이 아니면 스틱 스로틀을 무시하고 위치/자세
+    # 컨트롤러의 thrust_body[2](유효한 위치·속도 추정치가 있어야 의미 있는 값)를
+    # 대신 쓴다 — 실기에서 스로틀을 끝까지 눌러도 모터가 안 움직인 원인이 이거였다.
+    link.send_set_manual_mode()
+
     # 진단 A — PX4가 캘리브레이션에 등록해둔 센서 장치 ID를 읽어, HIL 시뮬레이션 센서의
     # 장치 ID와 같은지 대조한다. 다르면 PX4는 "등록된 그 센서"가 데이터를 안 준다고 보고
     # 'No valid data from Accel 0'으로 시동을 거부한다 — 이게 지금 의심 중인 원인.
@@ -304,6 +310,8 @@ def main():
                 while not arm_requests.empty():
                     want_armed = arm_requests.get_nowait()
                     print("[main] ARM 요청: %s" % ("ARM" if want_armed else "DISARM"))
+                    if want_armed:
+                        link.send_set_manual_mode()  # 다른 경로로 모드가 바뀌었어도 매 ARM마다 복구
                     link.send_arm(want_armed)
                     if want_armed:
                         # ARM을 시도하는 바로 그 순간 PX4에게 직접 물어본다. 브릿지를 끄고
