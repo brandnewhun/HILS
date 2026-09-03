@@ -53,16 +53,38 @@ class FlightDynamicsModel:
     def _mix_quad_x(m):
         """
         controls[0..3] -> (roll_mix, pitch_mix, yaw_mix, thrust_mix).
-        PX4 기본 Quad-X 에어프레임 관례를 가정한 근사치 — 실제 보드/airframe
-        파라미터의 모터 순서와 다를 수 있다. 실기 연동 후 어느 축이든 반대로
-        움직이면 이 함수의 인덱스/부호만 고치면 된다(다른 코드는 안 건드림).
-        가정한 배치: 0=전방우, 1=후방좌, 2=전방좌, 3=후방우 (대각쌍이 같은 회전방향).
+
+        예전에는 일반 쿼드-X 관례(대각쌍이 같은 회전방향)를 그냥 가정했었는데,
+        이 기체는 일반 쿼드가 아니라 커스텀 틸트로터라 실제 배분 행렬이 다르다.
+        실기 연동 중 사용자가 순수 스로틀만 올렸는데도 SIM에서 강한 롤이
+        발생해 실기 자세추정기가 진짜로 "Attitude failure (roll)"을 띄우며
+        disarm되는 걸 보고, 이 기체 전용 배분 모듈
+        (src/modules/tv_control_allocator/TiltVtolControlAllocator.cpp, hover
+        시 tilt~=0인 구간)의 실제 4x2 배분 행렬(b_inv)을 펌웨어 소스에서 직접
+        확인해 아래로 고쳤다(OFP는 안 건드림 — 그 행렬을 그대로 옮겨 온
+        SIM 쪽 근사치일 뿐):
+
+            b_inv = [[ 0.25, -0.25],   # motor0: +pitch, -roll
+                     [-0.25, -0.25],   # motor1: -pitch, -roll
+                     [-0.25,  0.25],   # motor2: -pitch, +roll
+                     [ 0.25,  0.25]]   # motor3: +pitch, +roll
+
+        위 행렬을 역으로 풀면 pitch = (m0+m3)-(m1+m2), roll = (m2+m3)-(m0+m1).
+        (예전 코드는 이 두 축을 서로 바꿔서 쓰고 있었다 — "roll_mix"라고 이름
+        붙인 식이 실제로는 pitch 차동이었다.)
+
+        요(yaw)는 이 배분식에서 tilt=0(완전 호버)일 때는 아예 등장하지 않는다
+        — 펌웨어 소스를 보면 저속/호버 구간의 요는 모터 추력 차동이 아니라
+        틸트 서보 각도 차동(tilt_servo_cmd)으로 만든다. 우리는 지금
+        actuator_motors(추력 4개)만 읽고 틸트 서보값은 안 읽어오므로, 이
+        SIM에서는 요를 물리적으로 재현할 수 없다 — yaw_mix는 항상 0으로 둔다
+        (없는 신호를 그럴듯하게 지어내는 것보다 안 만드는 쪽을 택함).
         """
         m0, m1, m2, m3 = m
         thrust_mix = (m0 + m1 + m2 + m3) / 4.0
-        roll_mix = (m0 + m3) - (m1 + m2)
-        pitch_mix = (m0 + m2) - (m1 + m3)
-        yaw_mix = (m0 + m1) - (m2 + m3)
+        pitch_mix = (m0 + m3) - (m1 + m2)
+        roll_mix = (m2 + m3) - (m0 + m1)
+        yaw_mix = 0.0
         return roll_mix, pitch_mix, yaw_mix, thrust_mix
 
     def step(self, dt, motors, tilt_setpoint=0.0):
