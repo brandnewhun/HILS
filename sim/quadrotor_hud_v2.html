@@ -373,6 +373,17 @@
     <div class="mode"><span class="dot"></span>HITL LIVE &middot; ICD-PXTR-HILS-001 CH&#9314;(C)</div>
   </div>
 
+  <!-- ARM/DISARM — HIL 모드에서는 실제 모터 PWM이 안 나가고 HIL_ACTUATOR_CONTROLS로
+       대체되므로 프로펠러가 돌지 않는다. 다만 ARM을 안 하면 PX4가 액추에이터 출력을
+       전부 0으로 막아 브릿지 FDM에 추력이 0으로 들어가고, 기체가 전혀 안 움직인다.
+       시동 시점을 사람이 항상 눈으로 보고 통제하도록 자동 ARM 대신 버튼으로 뒀다. -->
+  <div class="vehicle-selector panel" id="arm-panel" style="top:72px;">
+    <span class="group-label">Arm</span>
+    <button type="button" class="time-btn" id="arm-btn">ARM</button>
+    <button type="button" class="time-btn" id="disarm-btn">DISARM</button>
+    <span class="rc-text" id="arm-state" style="margin-left:4px">--</span>
+  </div>
+
   <div class="vehicle-selector panel">
     <span class="group-label">Vehicle</span>
     <button type="button" class="time-btn vehicle-btn active" data-vehicle-index="0">쿼드콥터</button>
@@ -973,7 +984,9 @@ var TERRAIN_DATA = {"meta":{"lat":37.27908611111111,"lon":127.10344722222221,"or
     var reconnectTimer = null;
     var reconnectDelay = RECONNECT_BASE_MS;
     var status = "connecting"; // "connecting" | "open" | "closed" | "error"
-    var onMessageCb = null;
+    // 리스너를 배열로 둔다 -- 예전에는 콜백 1개만 저장해서, 나중에 등록한 쪽이
+    // 앞서 등록한 쪽을 조용히 덮어써 버렸다(예: ARM 표시가 FlightSim에 밀림).
+    var onMessageCbs = [];
     var onStatusCb = null;
 
     function setStatus(s){
@@ -998,7 +1011,7 @@ var TERRAIN_DATA = {"meta":{"lat":37.27908611111111,"lon":127.10344722222221,"or
       ws.onmessage = function(ev){
         var data;
         try { data = JSON.parse(ev.data); } catch (e){ return; }
-        if (onMessageCb) onMessageCb(data);
+        for (var i=0; i<onMessageCbs.length; i++){ onMessageCbs[i](data); }
       };
       ws.onclose = function(){
         setStatus("closed");
@@ -1041,7 +1054,7 @@ var TERRAIN_DATA = {"meta":{"lat":37.27908611111111,"lon":127.10344722222221,"or
     return {
       get url(){ return wsUrl; },
       get status(){ return status; },
-      onMessage: function(fn){ onMessageCb = fn; },
+      onMessage: function(fn){ onMessageCbs.push(fn); },
       onStatusChange: function(fn){ onStatusCb = fn; },
       forceReconnect: forceReconnect,
       send: send
@@ -1063,6 +1076,24 @@ var TERRAIN_DATA = {"meta":{"lat":37.27908611111111,"lon":127.10344722222221,"or
   // 키맵은 v1과 동일: 화살표=피치/롤, A/D=요, W/S=스로틀. Target 조종(IJKL/UO)과
   // 겹치지 않는다(TargetDrone은 별도 keys 객체를 자체적으로 관리).
   // ==============================================================================
+  // ARM/DISARM 버튼 — 브릿지(bridge/main.py)에 {"type":"arm"} 메시지를 보내면 브릿지가
+  // MAV_CMD_COMPONENT_ARM_DISARM으로 실기에 전달한다. 현재 상태는 텔레메트리의
+  // armed 필드를 그대로 받아서 표시한다(버튼을 눌렀다고 표시를 바꾸지 않는다 --
+  // 실기가 실제로 시동이 걸렸는지가 진실이므로).
+  (function(Link){
+    var armBtn = document.getElementById("arm-btn");
+    var disarmBtn = document.getElementById("disarm-btn");
+    var stateEl = document.getElementById("arm-state");
+    if (armBtn) armBtn.addEventListener("click", function(){ Link.send({type:"arm", armed:true}); });
+    if (disarmBtn) disarmBtn.addEventListener("click", function(){ Link.send({type:"arm", armed:false}); });
+
+    Link.onMessage(function(pkt){
+      if (!stateEl || typeof pkt.armed !== "boolean") return;
+      stateEl.textContent = pkt.armed ? "ARMED" : "DISARMED";
+      stateEl.style.color = pkt.armed ? "var(--warn)" : "var(--text-dim)";
+    });
+  })(BridgeLink);
+
   var RcTx = (function(Link){
     var RC_HZ = 10; // ICD D-01(RC_CHANNELS)과 동일한 샘플-홀드 주기
     var keys = Object.create(null);

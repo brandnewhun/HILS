@@ -19,6 +19,10 @@ import time
 import geo
 
 
+def _clamp_unit(v):
+    return max(-1.0, min(1.0, v))
+
+
 def _send_filtered(send_fn, **kwargs):
     """pymavlink 버전에 따라 HIL_SENSOR/HIL_GPS의 'id'(instance) 필드가 있거나
     없을 수 있다(dialect 개정 시점 차이). send_fn이 실제로 받는 인자만 걸러서
@@ -169,6 +173,59 @@ class MavlinkLink:
             angular_velocity=[0.0, 0.0, 0.0, 0.0],
             current_ma=[0, 0, 0, 0],
             temperature_c=[25.0, 25.0, 25.0, 25.0],
+        )
+
+    # ── Channel D: ENV -> FCC (조종기 입력, RC_CHANNELS_OVERRIDE) ───────────────
+    # rc_values는 rc_source.RcSource.read()가 주는 {"pitch","roll","yaw","thr","tilt"}
+    # (-1..1 정규화값) — 이 값이 스크립트/키보드/실제 외부 송신기 중 어디서 왔는지는
+    # 여기서 전혀 모른다(main.py가 RcSource를 통해서만 넘겨준다).
+    #
+    # ★ 확인 필요 ★ chan5_raw(tilt)의 실제 채널 번호는 OFP의 RC_MAP_AUX* 파라미터
+    # (또는 tv_control_allocator가 참조하는 커스텀 매핑)와 반드시 대조할 것 — 여기서는
+    # "5번 채널"을 잠정값으로 썼을 뿐이다. pitch/roll/yaw/thr(1~4번)는 PX4 기본 RC_MAP_*
+    # 채널 배정(RC_MAP_ROLL=1, RC_MAP_PITCH=2, RC_MAP_THROTTLE=3, RC_MAP_YAW=4)을 그대로
+    # 따른 것이라 이 넷은 바뀔 일이 거의 없다.
+    #
+    # thr(스로틀)도 1500(중립)을 기준으로 -1..1을 매핑한다 — 이 브릿지가 시뮬레이팅하는
+    # 비행모드(HILS_ICD/sim/quadrotor_hud.html의 climbRate 모델)는 "중립=고도유지,
+    # +면 상승/-면 하강"인 자세/고도제어 모드 기준이라, 0=최소추력(정지)인 완전 수동
+    # ACRO/STABILIZED 스로틀 관례와는 다르다 — 실제 비행모드가 바뀌면 이 매핑도 재검토.
+    RC_CHANNEL_IGNORE = 65535  # MAVLink 관례: 이 값을 넣은 채널은 "오버라이드 안 함"
+
+    @staticmethod
+    def _rc_to_pwm(value, center=1500, span=500):
+        return int(max(1000, min(2000, center + _clamp_unit(value) * span)))
+
+    def send_rc_override(self, rc_values):
+        ignore = self.RC_CHANNEL_IGNORE
+        self.conn.mav.rc_channels_override_send(
+            target_system=getattr(self.conn, "target_system", 1) or 1,
+            target_component=getattr(self.conn, "target_component", 1) or 1,
+            chan1_raw=self._rc_to_pwm(rc_values.get("roll", 0.0)),
+            chan2_raw=self._rc_to_pwm(rc_values.get("pitch", 0.0)),
+            chan3_raw=self._rc_to_pwm(rc_values.get("thr", 0.0)),
+            chan4_raw=self._rc_to_pwm(rc_values.get("yaw", 0.0)),
+            chan5_raw=self._rc_to_pwm(rc_values.get("tilt", 0.0)),  # ★ 확인 필요 ★ 채널 번호
+            chan6_raw=ignore, chan7_raw=ignore, chan8_raw=ignore,
+        )
+
+    def send_arm(self, armed):
+        """시동/시동해제 명령(MAV_CMD_COMPONENT_ARM_DISARM).
+
+        HIL 모드(SYS_HITL=1)에서는 실제 모터 PWM이 나가지 않고 HIL_ACTUATOR_CONTROLS
+        메시지로 대체되므로, 여기서 ARM을 걸어도 프로펠러가 돌지 않는다. 하지만 ARM을
+        안 하면 PX4가 액추에이터 출력을 전부 0으로 막기 때문에, FDM에 들어가는 추력이
+        0이 되어 기체가 전혀 움직이지 않는다 — HIL에서 움직임을 보려면 반드시 필요하다.
+        """
+        from pymavlink import mavutil  # 이 파일의 다른 메서드들과 같은 지역 import 관례
+
+        self.conn.mav.command_long_send(
+            getattr(self.conn, "target_system", 1) or 1,
+            getattr(self.conn, "target_component", 1) or 1,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,                          # confirmation
+            1.0 if armed else 0.0,      # param1: 1=arm, 0=disarm
+            0, 0, 0, 0, 0, 0,
         )
 
     # ── Channel B: FCC -> ENV (수신) ──────────────────────────────────────────

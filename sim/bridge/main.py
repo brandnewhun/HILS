@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-HILS 브릿지 진입점 — config.py에서 설정을 읽어 아래 3개 독립 모듈을 그냥 순서대로
+HILS 브릿지 진입점 — config.py에서 설정을 읽어 아래 4개 독립 모듈을 그냥 순서대로
 연결만 한다(이 파일 자체에는 로직을 넣지 않는다. 로직을 바꾸려면 해당 모듈만 고칠 것):
 
   MavlinkLink(mavlink_link.py)   — Pixhawk와의 EICD-01 물리/논리 인터페이스
   FlightDynamicsModel(fdm.py)    — ENV의 비행동역학 계산
   TelemetryHub(telemetry_hub.py) — Channel C를 브라우저(quadrotor_hud_v2.html)로 전달
+  RcSource(rc_source.py)        — Channel D(조종기 입력)를 어디서 가져올지(스크립트/
+                                   수동/실제 외부 송신기)를 config.RC_SOURCE_MODE로 선택
 
 실행:
     cd HILS_ICD/sim/bridge
@@ -16,6 +18,7 @@ HILS 브릿지 진입점 — config.py에서 설정을 읽어 아래 3개 독립
 """
 import math
 import os
+import queue
 import sys
 import threading
 import time
@@ -25,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from fdm import FlightDynamicsModel
 from mavlink_link import MavlinkLink
+from rc_source import BrowserRcSource, ScriptedRcSource, create_rc_source
 from telemetry_hub import TelemetryHub
 
 
@@ -89,9 +93,25 @@ def main():
     print("[main] 시리얼 포트 오픈 완료 — HIL_ACTUATOR_CONTROLS/HEARTBEAT 대기 중...")
 
     dynamics = FlightDynamicsModel(config.FDM)
+    rc_source = create_rc_source(config.RC_SOURCE_MODE, config.RC_SOURCE_OPTIONS)
+    print("[main] RC 소스: %s" % config.RC_SOURCE_MODE)
     shared = SharedState()
 
-    hub = TelemetryHub(config.WS_HOST, config.WS_PORT, config.WS_BROADCAST_HZ, shared.read)
+    # 브라우저 -> 브릿지 방향 메시지 처리. RC_SOURCE_MODE="browser"일 때는 키보드 입력을
+    # rc_source로 흘려보내고, ARM/DISARM 요청은 어느 모드에서든 그대로 실기에 전달한다.
+    # (요청은 asyncio 스레드에서 들어오므로, 여기서 직접 MAVLink를 쓰지 않고 큐에 넣어
+    #  메인 루프가 보내게 한다 — 시리얼 쓰기를 한 스레드로 몰아 경합을 피하기 위함.)
+    arm_requests = queue.Queue()
+
+    def on_client_message(msg):
+        mtype = msg.get("type")
+        if mtype == "rc" and isinstance(rc_source, BrowserRcSource):
+            rc_source.on_message(msg)
+        elif mtype == "arm":
+            arm_requests.put(bool(msg.get("armed")))
+
+    hub = TelemetryHub(config.WS_HOST, config.WS_PORT, config.WS_BROADCAST_HZ, shared.read,
+                       on_client_message=on_client_message)
     hub.start()
 
     period = {k: 1.0 / v for k, v in config.RATES_HZ.items()}
@@ -113,6 +133,15 @@ def main():
             try:
                 link.poll_incoming()
 
+                if isinstance(rc_source, ScriptedRcSource):
+                    rc_source.advance(dt)
+
+                # 브라우저 ARM/DISARM 버튼 요청 처리 — 시리얼 쓰기는 이 스레드에서만.
+                while not arm_requests.empty():
+                    want_armed = arm_requests.get_nowait()
+                    print("[main] ARM 요청: %s" % ("ARM" if want_armed else "DISARM"))
+                    link.send_arm(want_armed)
+
                 motors = link.latest_actuator["motors"]
                 tilt_sp = link.latest_actuator["tilt_setpoint"]
                 dynamics.step(dt, motors, tilt_sp)
@@ -130,6 +159,8 @@ def main():
                             link.send_hil_gps(snap)
                         elif key == "tilt_state":
                             link.send_hil_tilt_state(snap)
+                        elif key == "rc":
+                            link.send_rc_override(rc_source.read())
 
                 shared.update(build_vis_payload(
                     snap,

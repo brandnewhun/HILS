@@ -15,11 +15,15 @@ import threading
 
 
 class TelemetryHub:
-    def __init__(self, host, port, broadcast_hz, state_provider):
+    def __init__(self, host, port, broadcast_hz, state_provider, on_client_message=None):
         self.host = host
         self.port = port
         self.period = 1.0 / broadcast_hz
         self.state_provider = state_provider  # () -> dict, 스레드 세이프해야 함
+        # 브라우저 -> 브릿지 방향 메시지(키보드 RC 입력, ARM 요청) 1건마다 호출되는 콜백.
+        # asyncio 스레드에서 호출되므로, 콜백 쪽에서 스레드 세이프하게 처리해야 한다
+        # (rc_source.BrowserRcSource가 락으로 그렇게 되어 있음).
+        self.on_client_message = on_client_message
         self._clients = set()
         self._thread = None
 
@@ -41,8 +45,15 @@ class TelemetryHub:
         # 호출되므로 둘 다 받아들이도록 가변인자로 둔다.
         self._clients.add(websocket)
         try:
-            async for _ in websocket:
-                pass  # 브라우저 -> 브릿지 방향 메시지는 없음(수신 전용 링크) — 들어와도 무시
+            async for raw in websocket:
+                if not self.on_client_message:
+                    continue  # 콜백을 안 걸었으면 기존처럼 수신 전용으로 동작(무시)
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(msg, dict):
+                    self.on_client_message(msg)
         finally:
             self._clients.discard(websocket)
 

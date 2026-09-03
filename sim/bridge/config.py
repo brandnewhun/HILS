@@ -9,7 +9,7 @@ HILS 브릿지 설정 — 이 파일 하나만 고치면 대부분의 운용 파
 
 # ── EICD-01: FCC ↔ ENV(본 브릿지) 물리 인터페이스 ──────────────────────────────
 # Windows 장치관리자(포트, COM & LPT)에서 Pixhawk가 잡는 COM 번호로 바꿔서 사용.
-SERIAL_PORT = "COM5"
+SERIAL_PORT = "COM11"
 
 # Pixhawk 자체 USB 포트(가상 CDC-ACM)는 USB native 속도라 baudrate가 무시된다.
 # TELEM 포트를 USB-시리얼(FTDI 등) 변환기로 뺄 경우에만 EICD-01 3.1.1절 값(921600)을 쓴다.
@@ -27,6 +27,33 @@ RATES_HZ = {
     "imu": 250,       # HIL_SENSOR (accel/gyro/mag/baro 한 메시지에 포함)
     "gps": 10,        # HIL_GPS
     "tilt_state": 20, # HIL_TILT_STATE(신규, 커스텀 다이얼렉트 있을 때만) — ICD C-06 재송출 주기와 정합
+    "rc": 10,         # RC_CHANNELS_OVERRIDE(Channel D) — HILS_ICD/sim/quadrotor_hud.html의
+                       # ICD_RATE.D01_RC와 동일한 10Hz(ICD-PXTR-HILS-001 9.4절)
+}
+
+# ── Channel D (ENV→FCC, 조종기 입력) 소스 선택 — rc_source.create_rc_source()가 이 값
+# 하나로 소스를 고른다. main.py나 mavlink_link.py는 손댈 필요 없음(rc_source.py 참조).
+#   "manual"          — 코드/콘솔에서 직접 값을 넣는 최소 구현
+#   "browser"         — 브라우저(quadrotor_hud_v2.html)의 키보드 입력을 WebSocket으로
+#                        받아서 그대로 사용 (지금 기본값 — 사람이 직접 조종하며 확인)
+#   "scripted"        — 정해진 (시각, 입력) 시퀀스를 반복 재생 (사람 없는 자동 검증용)
+#   "serial_receiver" — 실제 외부 송신기+리시버를 SIM PC에 연결했을 때 쓸 자리
+#                        (아직 미구현 — rc_source.py의 SerialReceiverRcSource 참조)
+RC_SOURCE_MODE = "browser"
+
+RC_SOURCE_OPTIONS = {
+    # "serial_receiver" 모드일 때만 의미 있음 — 실제 리시버가 정해지면 채울 것.
+    "port": None,
+    "protocol": "sbus",
+    # "scripted" 모드일 때 재생할 입력 시퀀스 — OFP RC 파이프라인이 살아있는지 확인하는
+    # 최소 시나리오: 스로틀 조금 줬다가, 피치를 줬다가, 요를 줘 본다.
+    "keyframes": [
+        (0.0, {}),
+        (3.0, {"thr": 0.3}),
+        (8.0, {"pitch": 0.3, "thr": 0.1}),
+        (13.0, {"yaw": 0.4, "thr": 0.1}),
+        (18.0, {}),
+    ],
 }
 
 # ── Channel C(FCC→VIS) 대신 이 브릿지가 자체 FDM 진실값을 그대로 내보내는 주기.
