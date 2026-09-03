@@ -288,13 +288,26 @@ class MavlinkLink:
         )
 
     def send_manual_control(self, rc_values):
-        """브라우저의 -1..1 입력을 PX4 joystick(MANUAL_CONTROL)으로 송신한다."""
-        def to_1000(key):
+        """브라우저의 -1..1 입력을 PX4 joystick(MANUAL_CONTROL)으로 송신한다.
+
+        x/y/r(pitch/roll/yaw)는 PX4가 그대로 ``/1000.f``만 해서 쓰므로 -1000..1000이
+        맞다. 하지만 z(throttle)는 다르다 — 펌웨어(mavlink_receiver.cpp
+        handle_message_manual_control)가 명시적으로 "backwards compatibility"로
+        z를 **0..1000**으로 기대하고 ``(z/1000)*2 - 1``로 내부 -1..1로 바꾼다.
+        예전 코드는 z도 다른 축처럼 -1000..1000으로 보내서, 중립(0)이 throttle=-1.0
+        (완전 컷오프)로, 아래쪽 끝(-1000)이 throttle=-3.0(스펙 밖 값)으로 해석되고
+        있었다 — 실기에서 ARM은 되는데 스로틀을 줘도 거의 안 움직이던 원인.
+        """
+        def to_1000_signed(key):
             return int(round(_clamp_unit(rc_values.get(key, 0.0)) * 1000))
 
+        def throttle_to_1000(key):
+            unit = _clamp_unit(rc_values.get(key, 0.0))  # -1..1
+            return int(round(((unit + 1.0) / 2.0) * 1000))  # -1..1 -> 0..1000
+
         self._count_tx("MANUAL_CONTROL")
-        x, y, z, r = (to_1000("pitch"), to_1000("roll"),
-                       to_1000("thr"), to_1000("yaw"))
+        x, y, r = (to_1000_signed("pitch"), to_1000_signed("roll"), to_1000_signed("yaw"))
+        z = throttle_to_1000("thr")
         self.conn.mav.manual_control_send(
             getattr(self.conn, "target_system", 1) or 1,
             x, y, z, r,
