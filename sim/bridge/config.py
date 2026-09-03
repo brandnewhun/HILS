@@ -29,7 +29,14 @@ RATES_HZ = {
     "tilt_state": 20, # HIL_TILT_STATE(신규, 커스텀 다이얼렉트 있을 때만) — ICD C-06 재송출 주기와 정합
     "rc": 10,         # RC_CHANNELS_OVERRIDE(Channel D) — HILS_ICD/sim/quadrotor_hud.html의
                        # ICD_RATE.D01_RC와 동일한 10Hz(ICD-PXTR-HILS-001 9.4절)
+    "actuator_probe": 5,  # 임시 SIM 어댑터: OFP uORB actuator_motors 조회
 }
+
+# OFP 수정 전 검증용 모터 입력 소스. 현재 OFP의 HIL_ACTUATOR_CONTROLS[0..3]은
+# 실제 actuator_motors와 연결되어 있지 않아 0으로 들어온다. "nsh_actuator_motors"는
+# 브리지가 NSH listener로 OFP의 진짜 motor vector를 읽어 FDM에 넣는다.
+# OFP의 HIL MAVLink 매핑이 수정된 뒤에는 "hil_controls"로 되돌린다.
+MOTOR_SOURCE_MODE = "nsh_actuator_motors"  # "nsh_actuator_motors" | "hil_controls"
 
 # PX4에 키보드 조종값을 넣는 MAVLink 메시지 형식.
 # 이전에 PX6C에서 검증된 MANUAL_CONTROL(joystick) 경로를 기본값으로 사용한다.

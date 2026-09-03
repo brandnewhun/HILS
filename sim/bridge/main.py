@@ -181,6 +181,8 @@ class DebugLogger:
             "armed": bool(link.is_armed()),
             "link_ok": bool(link.fcc_link_ok()),
             "motors": [round(m, 4) for m in link.latest_actuator["motors"]],
+            "ofp_motors": [round(m, 4) for m in link.latest_ofp_motors["motors"]],
+            "motor_source": config.MOTOR_SOURCE_MODE,
             "actuator_controls": [round(v, 4) for v in link.latest_actuator["all_controls"]],
             "actuator_flags": link.latest_actuator["flags"],
             "manual_control": dict(link.last_manual_control) if link.last_manual_control else None,
@@ -236,6 +238,7 @@ def main():
     print("[main] RC 소스: %s" % config.RC_SOURCE_MODE)
     print("[main] PX4 조종 입력: %s (%.0f Hz)" %
           (config.CONTROL_INPUT_PROTOCOL, config.RATES_HZ["rc"]))
+    print("[main] FDM 모터 소스: %s" % config.MOTOR_SOURCE_MODE)
     shared = SharedState()
 
     logger = DebugLogger(log_path) if log_path else None
@@ -318,7 +321,7 @@ def main():
                     for probe in ("listener actuator_outputs", "control_allocator status"):
                         link.send_shell_cmd(probe)
 
-                motors = link.latest_actuator["motors"]
+                motors = link.sim_motors(config.MOTOR_SOURCE_MODE)
                 tilt_sp = link.latest_actuator["tilt_setpoint"]
                 dynamics.step(dt, motors, tilt_sp)
                 snap = dynamics.snapshot()
@@ -347,6 +350,11 @@ def main():
                                     "(manual_control/rc_override 중 하나)" %
                                     config.CONTROL_INPUT_PROTOCOL
                                 )
+                        elif key == "actuator_probe":
+                            # OFP 변경 없이 control allocator의 진짜 모터 벡터를 FDM에
+                            # 묶는 임시 어댑터. HIL controls 표준 매핑이 확보되면 제거 가능.
+                            if config.MOTOR_SOURCE_MODE == "nsh_actuator_motors":
+                                link.send_shell_cmd("listener actuator_motors")
 
                 shared.update(build_vis_payload(
                     snap,

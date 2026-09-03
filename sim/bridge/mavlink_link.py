@@ -16,6 +16,7 @@ import collections
 import inspect
 import math
 import random
+import re
 import time
 
 import geo
@@ -106,6 +107,7 @@ class MavlinkLink:
         # PX4 내부까지 들어갔는지 대조하기 위함).
         self.sys_status_sensors = {}
         self.latest_highres_imu = {}
+        self.latest_ofp_motors = {"motors": [0.0, 0.0, 0.0, 0.0], "updated_s": 0.0}
         self._shell_buffer = ""
         self.recent_events = collections.deque(maxlen=40)
 
@@ -368,6 +370,19 @@ class MavlinkLink:
                     line, self._shell_buffer = self._shell_buffer.split("\n", 1)
                     line = line.strip()
                     if line:
+                        # NSH ``listener actuator_motors``의 실제 OFP control allocator
+                        # 출력. HIL_ACTUATOR_CONTROLS의 현 OFP 채널 배치가 표준 모터
+                        # 배열과 달라 임시 SIM 어댑터가 이 값을 FDM에 사용한다.
+                        match = re.search(r"control:\s*\[([^\]]+)\]", line)
+                        if match:
+                            try:
+                                values = [float(v.strip()) for v in match.group(1).split(",")]
+                                if len(values) >= 4:
+                                    self.latest_ofp_motors = {
+                                        "motors": values[:4], "updated_s": time.time()
+                                    }
+                            except ValueError:
+                                pass
                         self._record_event("NSH: %s" % line)
                 continue
             if mtype == "COMMAND_ACK":
@@ -491,3 +506,17 @@ class MavlinkLink:
         """가장 최근 HEARTBEAT의 MAV_MODE_FLAG_SAFETY_ARMED 비트. HEARTBEAT를 아직
         한 번도 못 받았으면(따라서 fcc_link_ok()도 False) 항상 False."""
         return self._fcc_armed and self.fcc_link_ok()
+
+    def sim_motors(self, source_mode):
+        """FDM이 사용할 모터 벡터를 선택한다.
+
+        ``nsh_actuator_motors``는 OFP 수정 전의 임시 검증 경로다. 새 uORB 스냅샷이
+        1초 이상 안 들어오면 안전하게 0을 반환해 오래된 추력이 남지 않게 한다.
+        """
+        if source_mode == "hil_controls":
+            return list(self.latest_actuator["motors"])
+        if source_mode == "nsh_actuator_motors":
+            if time.time() - self.latest_ofp_motors["updated_s"] <= 1.0:
+                return list(self.latest_ofp_motors["motors"])
+            return [0.0, 0.0, 0.0, 0.0]
+        raise ValueError("알 수 없는 MOTOR_SOURCE_MODE: %r" % source_mode)
