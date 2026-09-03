@@ -12,11 +12,25 @@ dialect에 없다. config.CUSTOM_TILT_DIALECT_ENABLED가 True인데 실제 pymav
 상태) 경고만 남기고 조용히 건너뛴다 — 그동안도 쿼드콥터(틸트 없음) 경로는
 완전히 정상 동작한다.
 """
+import collections
 import inspect
 import math
 import time
 
 import geo
+
+
+# COMMAND_ACK.result 코드 -> 사람이 읽을 수 있는 이름. 시동이 거부됐을 때 그 이유를
+# 숫자가 아니라 말로 보기 위한 표다(MAV_RESULT).
+_ACK_RESULT_TEXT = {
+    0: "ACCEPTED",
+    1: "TEMPORARILY_REJECTED",
+    2: "DENIED",
+    3: "UNSUPPORTED",
+    4: "FAILED",
+    5: "IN_PROGRESS",
+    6: "CANCELLED",
+}
 
 
 def _clamp_unit(v):
@@ -51,6 +65,11 @@ class MavlinkLink:
         }
         self.last_heartbeat_from_fcc = None
         self._fcc_armed = False
+
+        # 진단용 — 어떤 메시지가 몇 건 들어왔는지(HIL_ACTUATOR_CONTROLS가 아예 안 오는지
+        # 등을 구분), 그리고 PX4가 보낸 STATUSTEXT/COMMAND_ACK의 최근 기록.
+        self.msg_counts = {}
+        self.recent_events = collections.deque(maxlen=40)
 
     def connect(self):
         from pymavlink import mavutil
@@ -238,6 +257,27 @@ class MavlinkLink:
             if msg is None:
                 break
             mtype = msg.get_type()
+            self.msg_counts[mtype] = self.msg_counts.get(mtype, 0) + 1
+
+            # PX4가 "왜 안 되는지"를 말해주는 두 메시지 — QGC를 안 쓰면 아무도 안 듣게
+            # 되므로 여기서 잡아 바로 콘솔에 찍는다. 시동 거부 사유("Arming denied: ...",
+            # "Preflight Fail: ...")가 대부분 여기로 나온다.
+            if mtype == "STATUSTEXT":
+                text = getattr(msg, "text", "")
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", "replace")
+                text = text.strip("\x00").strip()
+                if text:
+                    self._record_event("STATUSTEXT[sev=%s] %s" % (getattr(msg, "severity", "?"), text))
+                continue
+            if mtype == "COMMAND_ACK":
+                result = getattr(msg, "result", None)
+                self._record_event(
+                    "COMMAND_ACK cmd=%s result=%s(%s)"
+                    % (getattr(msg, "command", "?"), result, _ACK_RESULT_TEXT.get(result, "?"))
+                )
+                continue
+
             if mtype == "HEARTBEAT":
                 # 이 연결은 Pixhawk 1대와의 점대점(serial) 링크이므로, 여기 들어오는
                 # HEARTBEAT는 항상 FCC가 보낸 것이다(수신 쪽에는 우리 자신이 보낸
@@ -261,6 +301,13 @@ class MavlinkLink:
                 self.latest_actuator["tilt_setpoint"] = (sum(angles) / len(angles)) / 90.0 if angles else 0.0
             elif on_telemetry_message is not None:
                 on_telemetry_message(msg)
+
+    def _record_event(self, text):
+        """PX4가 보낸 진단 메시지를 콘솔에 즉시 찍고, --log용으로도 남겨둔다.
+        시동 거부 사유처럼 놓치면 원인을 못 찾는 정보라 버퍼링하지 않고 바로 출력한다."""
+        stamped = "%.1f %s" % (time.time(), text)
+        self.recent_events.append(stamped)
+        print("[FCC] %s" % text, flush=True)
 
     def fcc_link_ok(self, timeout_s=1.5):
         """EICD-01 3.1.5절 페일세이프 판단 기준(HEARTBEAT 1.5초 미수신)과 동일 임계값."""

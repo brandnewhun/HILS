@@ -16,6 +16,7 @@ HILS 브릿지 진입점 — config.py에서 설정을 읽어 아래 4개 독립
 그 다음 브라우저에서 quadrotor_hud_v2.html을 열면(기본 ws://localhost:8765로 접속)
 "BRIDGE 연결됨" 표시와 함께 텔레메트리가 들어오기 시작한다.
 """
+import json
 import math
 import os
 import queue
@@ -86,7 +87,61 @@ def connect_with_retry(link, retry_delay_s=3.0):
             time.sleep(retry_delay_s)
 
 
+class DebugLogger:
+    """진단용 JSONL 로거 — 한 줄에 한 스냅샷. --log 로 켠다.
+
+    HIL에서 "안 움직인다"의 원인을 좁히려면 아래 넷을 같이 봐야 한다:
+      rc     : 브라우저에서 온 조종 입력이 실제로 브릿지까지 왔는가
+      armed  : PX4가 실제로 시동 상태인가 (버튼을 눌렀는지와 별개)
+      motors : PX4가 HIL_ACTUATOR_CONTROLS로 돌려준 모터 명령 — 이게 계속 0이면
+               FDM에 추력이 안 들어가니 당연히 안 움직인다
+      msgs   : 메시지 종류별 수신 건수 — HIL_ACTUATOR_CONTROLS가 아예 0이면
+               PX4가 HIL 모드로 안 떠 있다는 뜻
+    events에는 PX4가 보낸 STATUSTEXT/COMMAND_ACK(시동 거부 사유)이 쌓인다.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self._f = open(path, "w", encoding="utf-8")
+        self._t0 = time.time()
+        self._events_written = 0
+
+    def write(self, link, rc_values, snap):
+        events = list(link.recent_events)
+        new_events = events[self._events_written:]
+        self._events_written = len(events)
+        rec = {
+            "t": round(time.time() - self._t0, 2),
+            "rc": {k: round(v, 3) for k, v in rc_values.items()},
+            "armed": bool(link.is_armed()),
+            "link_ok": bool(link.fcc_link_ok()),
+            "motors": [round(m, 4) for m in link.latest_actuator["motors"]],
+            "tilt_sp": round(link.latest_actuator["tilt_setpoint"], 4),
+            "fdm": {
+                "north": round(snap["north"], 2), "east": round(snap["east"], 2),
+                "alt": round(snap["alt"], 2),
+                "roll": round(snap["roll"], 3), "pitch": round(snap["pitch"], 3),
+                "heading": round(snap["heading"], 3),
+            },
+            "msgs": dict(link.msg_counts),
+            "events": new_events,
+        }
+        self._f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._f.flush()  # Ctrl+C로 끊어도 지금까지 기록이 남도록
+
+    def close(self):
+        try:
+            self._f.close()
+        except Exception:
+            pass
+
+
 def main():
+    log_path = None
+    if "--log" in sys.argv:
+        idx = sys.argv.index("--log")
+        log_path = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else "bridge_debug.jsonl"
+
     print("[main] Pixhawk 연결 시도: %s (baud=%s)" % (config.SERIAL_PORT, config.SERIAL_BAUD))
     link = MavlinkLink(config)
     connect_with_retry(link)
@@ -113,6 +168,11 @@ def main():
     hub = TelemetryHub(config.WS_HOST, config.WS_PORT, config.WS_BROADCAST_HZ, shared.read,
                        on_client_message=on_client_message)
     hub.start()
+
+    logger = DebugLogger(log_path) if log_path else None
+    if logger:
+        print("[main] debug log -> %s" % os.path.abspath(log_path))
+    log_next_due = 0.0
 
     period = {k: 1.0 / v for k, v in config.RATES_HZ.items()}
     next_due = {k: 0.0 for k in period}
@@ -168,6 +228,10 @@ def main():
                     armed=link.is_armed(),
                     link_ok=link.fcc_link_ok(),
                 ))
+
+                if logger is not None and wall_now >= log_next_due:
+                    log_next_due = wall_now + 0.2   # 5Hz
+                    logger.write(link, rc_source.read(), snap)
             except KeyboardInterrupt:
                 raise
             except Exception as e:
@@ -188,6 +252,10 @@ def main():
             time.sleep(0.001)
     except KeyboardInterrupt:
         print("\n[main] 종료합니다.")
+    finally:
+        if logger is not None:
+            logger.close()
+            print("[main] debug log saved: %s" % os.path.abspath(log_path))
 
 
 if __name__ == "__main__":
