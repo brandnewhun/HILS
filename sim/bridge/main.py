@@ -36,6 +36,7 @@ from mavlink_link import MavlinkLink, SIM_DEVICE_IDS
 from rc_source import BrowserRcSource, ScriptedRcSource, create_rc_source
 from telemetry_hub import TelemetryHub
 from world_model import WorldModel
+from session_log import SessionLogger, build_snapshot
 
 
 class SharedState:
@@ -103,6 +104,7 @@ def connect_with_retry(link, retry_delay_s=3.0):
             return
         except Exception as e:
             print("[main] 시리얼 연결 실패(%s: %s) — %.0f초 후 재시도" % (type(e).__name__, e, retry_delay_s))
+            link._emit("link", "connect failed: %s: %s" % (type(e).__name__, e))
             time.sleep(retry_delay_s)
 
 
@@ -111,11 +113,13 @@ def reboot_fcc_and_reconnect(link, settle_s=2.0, heartbeat_wait_s=30.0):
     올 때까지 재연결을 기다린다. 이유는 config.REBOOT_FCC_ON_START 주석 참조(FDM을
     초기화할 때 FC의 EKF2도 같이 초기화하지 않으면 지자기 고장이 래치됨)."""
     print("[main] FC 재부팅 요청(NSH reboot) — 시뮬레이션과 FC 내부 상태(EKF2)를 함께 초기화")
+    link._emit("reboot", "request")  # 모듈 함수라 session이 없어 link의 이벤트 훅으로 기록
     try:
         link.send_shell_cmd("reboot")
         time.sleep(0.5)  # 명령이 시리얼로 실제로 나갈 시간
     except Exception as e:
         print("[main] reboot 명령 전송 실패(%s: %s) — 재연결만 시도" % (type(e).__name__, e))
+        link._emit("reboot", "send failed: %s" % type(e).__name__)
     try:
         if link.conn is not None:
             link.conn.close()
@@ -132,9 +136,11 @@ def reboot_fcc_and_reconnect(link, settle_s=2.0, heartbeat_wait_s=30.0):
         try:
             if link.conn.wait_heartbeat(timeout=3) is not None:
                 print("[main] FC 재부팅 완료 — HEARTBEAT 수신, 재연결됨")
+                link._emit("reboot", "done: heartbeat received")
                 return
         except Exception as e:
             print("[main] 재부팅 중 시리얼 단절(%s) — 포트 재오픈" % type(e).__name__)
+            link._emit("link", "serial lost during reboot: %s" % type(e).__name__)
             try:
                 if link.conn is not None:
                     link.conn.close()
@@ -199,93 +205,35 @@ def serve_hud_and_open_browser():
         print("[main] 브라우저 자동 실행 실패 - 위 주소를 직접 여세요.")
 
 
-class DebugLogger:
-    """진단용 JSONL 로거 — 한 줄에 한 스냅샷. --log 로 켠다.
-
-    HIL에서 "안 움직인다"의 원인을 좁히려면 아래 넷을 같이 봐야 한다:
-      rc     : 브라우저에서 온 조종 입력이 실제로 브릿지까지 왔는가
-      armed  : PX4가 실제로 시동 상태인가 (버튼을 눌렀는지와 별개)
-      motors : PX4가 HIL_ACTUATOR_CONTROLS로 돌려준 모터 명령 — 이게 계속 0이면
-               FDM에 추력이 안 들어가니 당연히 안 움직인다
-      msgs   : 메시지 종류별 수신 건수 — HIL_ACTUATOR_CONTROLS가 아예 0이면
-               PX4가 HIL 모드로 안 떠 있다는 뜻
-    events에는 PX4가 보낸 STATUSTEXT/COMMAND_ACK(시동 거부 사유)이 쌓인다.
-    """
-
-    def __init__(self, path):
-        self.path = path
-        self._f = open(path, "w", encoding="utf-8")
-        self._t0 = time.time()
-        self._events_written = 0
-        self._lock = threading.Lock()
-
-    def _write_record(self, rec):
-        """WebSocket 스레드와 main 스레드가 같은 JSONL에 안전하게 기록한다."""
-        with self._lock:
-            self._f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            self._f.flush()
-
-    def write_header(self, info):
-        """첫 줄에 실행 환경 정보(캘리브레이션 ID 등)를 한 번만 기록."""
-        rec = {"t": 0.0, "header": info}
-        self._write_record(rec)
-
-    def record_client_message(self, msg):
-        """브라우저가 보낸 키/RC/ARM 이벤트를 수신 즉시 같은 시간축에 기록한다."""
-        fields = ("type", "action", "key", "browser_ms", "pitch", "roll", "yaw", "thr", "armed")
-        safe_msg = {key: msg[key] for key in fields if key in msg}
-        self._write_record({
-            "t": round(time.time() - self._t0, 3),
-            "kind": "browser_input",
-            "message": safe_msg,
-        })
-
-    def write(self, link, rc_values, snap):
-        events = list(link.recent_events)
-        new_events = events[self._events_written:]
-        self._events_written = len(events)
-        rec = {
-            "t": round(time.time() - self._t0, 2),
-            "kind": "snapshot",
-            "rc": {k: round(v, 3) for k, v in rc_values.items()},
-            "armed": bool(link.is_armed()),
-            "link_ok": bool(link.fcc_link_ok()),
-            "motors": [round(m, 4) for m in link.latest_actuator["motors"]],
-            "ofp_motors": [round(m, 4) for m in link.latest_ofp_motors["motors"]],
-            "motor_source": config.MOTOR_SOURCE_MODE,
-            "actuator_controls": [round(v, 4) for v in link.latest_actuator["all_controls"]],
-            "actuator_flags": link.latest_actuator["flags"],
-            "manual_control": dict(link.last_manual_control) if link.last_manual_control else None,
-            "tilt_sp": round(link.latest_actuator["tilt_setpoint"], 4),
-            "fdm": {
-                "north": round(snap["north"], 2), "east": round(snap["east"], 2),
-                "alt": round(snap["alt"], 2),
-                "roll": round(snap["roll"], 3), "pitch": round(snap["pitch"], 3),
-                "heading": round(snap["heading"], 3),
-            },
-            "msgs": dict(link.msg_counts),
-            "tx": dict(link.tx_counts),
-            "sensors": dict(link.sys_status_sensors),
-            "hires_imu": dict(link.latest_highres_imu),
-            "events": new_events,
-        }
-        self._write_record(rec)  # Ctrl+C로 끊어도 지금까지 기록이 남도록
-
-    def close(self):
-        try:
-            self._f.close()
-        except Exception:
-            pass
+# (예전 DebugLogger는 session_log.SessionLogger로 대체됐다 — 항상 켜지는 세션 폴더에
+#  console.log / events.jsonl / snapshot.jsonl / browser.jsonl / mavlink.tlog / session.json.
+#  HIL에서 "안 움직인다"를 좁힐 때 보는 것: snapshot의 rc(입력 도달), armed(실제 시동),
+#  ofp_motors(FDM에 들어간 모터), msgs(HIL_ACTUATOR_CONTROLS 수신 여부); events의 STATUSTEXT
+#  (시동 거부 사유)/mode(MANUAL<->POSCTL 전환)/arm_state.)
 
 
 def main():
-    log_path = None
+    # --tag <이름>: 세션 로그 폴더명에 붙는 라벨(예: --tag hover-test). 예전 --log <파일>은
+    # 세션 로깅으로 대체되어 더 이상 필요 없다(주면 안내만 하고 무시).
+    tag = None
+    if "--tag" in sys.argv:
+        idx = sys.argv.index("--tag")
+        tag = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else None
     if "--log" in sys.argv:
-        idx = sys.argv.index("--log")
-        log_path = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else "bridge_debug.jsonl"
+        print("[main] 참고: --log 는 더 이상 필요 없습니다 — 로그는 항상 %s/<세션>/ 에 남습니다(--tag 로 라벨만 지정)"
+              % config.LOG_DIR)
+
+    # 세션 로거는 가장 먼저 — 시리얼 연결 재시도 메시지부터 console.log에 남도록.
+    session = SessionLogger(os.path.join(os.path.dirname(os.path.abspath(__file__)), config.LOG_DIR), tag=tag)
+    session.install_console_tee()
+    session.write_session_header(config)
+    print("[main] 세션 로그 폴더: %s" % session.dir)
 
     print("[main] Pixhawk 연결 시도: %s (baud=%s)" % (config.SERIAL_PORT, config.SERIAL_BAUD))
     link = MavlinkLink(config)
+    link.on_event = session.on_link_event          # FCC 이벤트(STATUSTEXT/ACK/NSH/모드/ARM)를 events.jsonl로
+    if getattr(config, "LOG_MAVLINK_TLOG", True):
+        link.tlog_path = session.path("mavlink.tlog")  # 수신 MAVLink 원본(재연결마다 append)
     connect_with_retry(link)
     print("[main] 시리얼 포트 오픈 완료 — HIL_ACTUATOR_CONTROLS/HEARTBEAT 대기 중...")
     if getattr(config, "REBOOT_FCC_ON_START", False):
@@ -320,11 +268,9 @@ def main():
     print("[main] FDM 모터 소스: %s" % config.MOTOR_SOURCE_MODE)
     shared = SharedState()
 
-    logger = DebugLogger(log_path) if log_path else None
-    if logger:
-        logger.write_header({"cal_ids": cal_ids, "sim_device_ids": SIM_DEVICE_IDS,
-                             "control_input_protocol": config.CONTROL_INPUT_PROTOCOL})
-        print("[main] debug log -> %s" % os.path.abspath(log_path))
+    session.update_session(cal_ids=cal_ids, sim_device_ids=SIM_DEVICE_IDS,
+                           control_input_protocol=config.CONTROL_INPUT_PROTOCOL,
+                           motor_source_mode=config.MOTOR_SOURCE_MODE)
 
     # 브라우저 -> 브릿지 방향 메시지 처리. RC_SOURCE_MODE="browser"일 때는 키보드 입력을
     # rc_source로 흘려보내고, ARM/DISARM 요청은 어느 모드에서든 그대로 실기에 전달한다.
@@ -334,8 +280,7 @@ def main():
     reset_requests = queue.Queue()
 
     def on_client_message(msg):
-        if logger:
-            logger.record_client_message(msg)
+        session.browser(msg)  # 브라우저 -> 브릿지 원본(키/rc/arm/reset) 전부 browser.jsonl로
         mtype = msg.get("type")
         if mtype == "rc" and isinstance(rc_source, BrowserRcSource):
             rc_source.on_message(msg)
@@ -387,6 +332,8 @@ def main():
                 while not arm_requests.empty():
                     want_armed = arm_requests.get_nowait()
                     print("[main] ARM 요청: %s" % ("ARM" if want_armed else "DISARM"))
+                    session.event("arm_request", "ARM" if want_armed else "DISARM",
+                                  rc=rc_source.read(), armed_now=link.is_armed())
                     if want_armed:
                         link.send_set_manual_mode()  # 다른 경로로 모드가 바뀌었어도 매 ARM마다 복구
                     link.send_arm(want_armed)
@@ -427,9 +374,11 @@ def main():
                     if link.is_armed():
                         last_reset_denied_at = time.time()
                         print("[main] RESET 요청 무시 — 먼저 DISARM 하세요")
+                        session.event("reset", "denied: armed")
                     else:
                         dynamics.reset()
                         print("[main] FDM을 원점으로 리셋했습니다")
+                        session.event("reset", "fdm reset to origin")
                         if getattr(config, "REBOOT_FCC_ON_RESET", False):
                             # FDM만 원점으로 되돌리면 FC의 EKF2는 이전 위치/자세를 기억한
                             # 채 "순간이동"을 겪어 지자기 고장이 래치된다 — FC도 같이 초기화.
@@ -486,9 +435,9 @@ def main():
                     reset_denied_at=last_reset_denied_at,
                 ))
 
-                if logger is not None and wall_now >= log_next_due:
-                    log_next_due = wall_now + 0.2   # 5Hz
-                    logger.write(link, rc_source.read(), snap)
+                if wall_now >= log_next_due:
+                    log_next_due = wall_now + 1.0 / max(0.1, getattr(config, "LOG_SNAPSHOT_HZ", 5))
+                    session.snapshot(build_snapshot(link, rc_source.read(), snap, config.MOTOR_SOURCE_MODE))
             except KeyboardInterrupt:
                 raise
             except Exception as e:
@@ -498,6 +447,7 @@ def main():
                 # PX4는 EICD-01 3.1.5절 페일세이프(HIL_SENSOR 500ms 미수신)를 스스로
                 # 타게 된다 — 그게 이 상황에서 기대되는 정상 동작이다.
                 print("[main] MAVLink I/O 오류(%s: %s) — 재연결 시도" % (type(e).__name__, e))
+                session.event("link", "io error: %s: %s" % (type(e).__name__, e))
                 try:
                     if link.conn is not None:
                         link.conn.close()
@@ -509,10 +459,11 @@ def main():
             time.sleep(0.001)
     except KeyboardInterrupt:
         print("\n[main] 종료합니다.")
+        session.event("bridge", "shutdown (KeyboardInterrupt)")
     finally:
-        if logger is not None:
-            logger.close()
-            print("[main] debug log saved: %s" % os.path.abspath(log_path))
+        log_dir = session.dir
+        session.close()  # stdout/stderr 원복 후
+        print("[main] 세션 로그 저장 완료: %s" % log_dir)
 
 
 if __name__ == "__main__":

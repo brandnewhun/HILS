@@ -35,6 +35,14 @@ _ACK_RESULT_TEXT = {
 }
 
 
+# HEARTBEAT.custom_mode 상위 바이트(main_mode) -> 이름. px4_custom_mode.h의
+# PX4_CUSTOM_MAIN_MODE_* 와 같은 번호(1부터). 모드 변화 이벤트를 사람이 읽기 위함.
+_PX4_MAIN_MODE_TEXT = {
+    1: "MANUAL", 2: "ALTCTL", 3: "POSCTL", 4: "AUTO", 5: "ACRO",
+    6: "OFFBOARD", 7: "STABILIZED", 8: "RATTITUDE", 9: "SIMPLE", 10: "TERMINATION",
+}
+
+
 # SYS_STATUS의 onboard_control_sensors_* 비트 — PX4가 "이 센서가 존재하는가/켜져
 # 있는가/정상인가"를 스스로 보고하는 값이다. 시동 거부 원인을 좁힐 때, 우리가 주입한
 # 센서가 PX4 눈에 실제로 어떻게 보이는지 확인하는 용도.
@@ -111,6 +119,20 @@ class MavlinkLink:
         self._shell_buffer = ""
         self.recent_events = collections.deque(maxlen=40)
 
+        # 세션 로깅 훅(session_log.SessionLogger.on_link_event). main.py가 연결한다.
+        #   on_event(kind, text, **extra) — statustext / command_ack / nsh / arm_state /
+        #   mode / system_time 이벤트를 유실 없이 개별 레코드로 남기기 위함.
+        self.on_event = None
+        # 수신 MAVLink 원본을 남길 tlog 경로(main.py가 설정). connect()마다 append로
+        # 다시 붙이므로 재연결/FC 재부팅을 거쳐도 한 파일에 이어진다.
+        self.tlog_path = None
+        # HEARTBEAT에서 custom_mode/armed가 바뀐 순간을 이벤트로 남기기 위한 이전값
+        self._last_custom_mode = None
+        self._last_armed_seen = None
+        self.last_system_time = None
+        # 5Hz actuator_motors 프로브 응답 구간 추적 — 콘솔 에코 억제용(events엔 항상 기록)
+        self._nsh_in_actuator_probe = False
+
     def connect(self):
         from pymavlink import mavutil
         c = self.config
@@ -120,7 +142,23 @@ class MavlinkLink:
             source_system=c.MAV_SOURCE_SYSTEM,
             source_component=c.MAV_SOURCE_COMPONENT,
         )
+        if self.tlog_path:
+            try:
+                # pymavlink 표준 tlog(8바이트 usec 타임스탬프 + 메시지 원본). 수신만 기록된다.
+                self.conn.setup_logfile(self.tlog_path, mode="ab")
+            except Exception as e:
+                print("[mavlink_link] tlog 기록 설정 실패(%s: %s) — 계속 진행" % (type(e).__name__, e))
+        self._emit("link", "serial connected %s" % c.SERIAL_PORT)
         return self.conn
+
+    def _emit(self, kind, text, **extra):
+        """세션 로거로 이벤트 전달(연결 안 됐으면 무시). 로깅 실패가 브릿지를 멈추지 않게."""
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(kind, text, **extra)
+        except Exception:
+            pass
 
     # ── Channel A: ENV -> FCC (송신) ──────────────────────────────────────────
     def send_heartbeat(self):
@@ -410,7 +448,9 @@ class MavlinkLink:
                     text = text.decode("utf-8", "replace")
                 text = text.strip("\x00").strip()
                 if text:
-                    self._record_event("STATUSTEXT[sev=%s] %s" % (getattr(msg, "severity", "?"), text))
+                    sev = getattr(msg, "severity", "?")
+                    self._record_event("STATUSTEXT[sev=%s] %s" % (sev, text))
+                    self._emit("statustext", text, severity=sev)
                 continue
             if mtype == "SERIAL_CONTROL":
                 # NSH 셸 응답 조각 -- send_shell_cmd()로 보낸 명령의 출력이 여러 조각으로
@@ -435,14 +475,36 @@ class MavlinkLink:
                                     }
                             except ValueError:
                                 pass
-                        self._record_event("NSH: %s" % line)
+                        # 5Hz actuator_motors 프로브 응답 구간(명령 에코 ~ reversible_flags)만
+                        # 콘솔 에코를 억제할 수 있다(config.CONSOLE_ECHO_ACTUATOR_PROBE).
+                        # events.jsonl에는 항상 남긴다.
+                        if "listener actuator_motors" in line:
+                            self._nsh_in_actuator_probe = True
+                        echo = getattr(self.config, "CONSOLE_ECHO_ACTUATOR_PROBE", True) or not self._nsh_in_actuator_probe
+                        self._record_event("NSH: %s" % line, echo=echo)
+                        self._emit("nsh", line, probe=self._nsh_in_actuator_probe)
+                        if self._nsh_in_actuator_probe and line.startswith("reversible_flags"):
+                            self._nsh_in_actuator_probe = False
                 continue
             if mtype == "COMMAND_ACK":
                 result = getattr(msg, "result", None)
+                cmd = getattr(msg, "command", "?")
                 self._record_event(
-                    "COMMAND_ACK cmd=%s result=%s(%s)"
-                    % (getattr(msg, "command", "?"), result, _ACK_RESULT_TEXT.get(result, "?"))
+                    "COMMAND_ACK cmd=%s result=%s(%s)" % (cmd, result, _ACK_RESULT_TEXT.get(result, "?"))
                 )
+                self._emit("command_ack", _ACK_RESULT_TEXT.get(result, "?"), command=cmd, result=result)
+                continue
+            if mtype == "SYSTEM_TIME":
+                # FC 부팅시각(time_boot_ms) <-> Unix 시각 매핑. FC의 ulog 타임스탬프(부팅
+                # 기준 us)를 PC 시각/이 세션의 t로 환산할 때 필요. 처음 1회만 이벤트로.
+                mapping = {
+                    "fc_time_unix_usec": int(getattr(msg, "time_unix_usec", 0)),
+                    "fc_time_boot_ms": int(getattr(msg, "time_boot_ms", 0)),
+                    "pc_time_unix": time.time(),
+                }
+                if self.last_system_time is None:
+                    self._emit("system_time", "first SYSTEM_TIME", **mapping)
+                self.last_system_time = mapping
                 continue
 
             if mtype == "SYS_STATUS":
@@ -483,6 +545,18 @@ class MavlinkLink:
                 # 오인했는데, PX4는 Disarm 상태에서도 HIL_ACTUATOR_CONTROLS를 계속
                 # 보내므로 그 플래그는 한 번 true가 되면 계속 true로 고정되는 버그였음.)
                 self._fcc_armed = bool(msg.base_mode & 0x80)
+                # armed / custom_mode(main_mode=상위 바이트, PX4_CUSTOM_MAIN_MODE_*)가 바뀐
+                # 순간만 이벤트로 — "언제 MANUAL에서 POSCTL로 돌아갔나" 같은 걸 추적하기 위함.
+                if self._fcc_armed != self._last_armed_seen:
+                    self._emit("arm_state", "ARMED" if self._fcc_armed else "DISARMED", armed=self._fcc_armed)
+                    self._last_armed_seen = self._fcc_armed
+                custom_mode = int(getattr(msg, "custom_mode", 0))
+                if custom_mode != self._last_custom_mode:
+                    main_mode = (custom_mode >> 16) & 0xFF
+                    sub_mode = (custom_mode >> 24) & 0xFF
+                    self._emit("mode", _PX4_MAIN_MODE_TEXT.get(main_mode, "main_mode=%d" % main_mode),
+                               custom_mode=custom_mode, main_mode=main_mode, sub_mode=sub_mode)
+                    self._last_custom_mode = custom_mode
             elif mtype == "HIL_ACTUATOR_CONTROLS":
                 controls = list(msg.controls)
                 self.latest_actuator["motors"] = controls[0:4]
@@ -541,12 +615,14 @@ class MavlinkLink:
         """ENV -> FCC 송신 건수. 로그에서 '보내긴 했는가'를 '받았는가'와 나눠 보기 위함."""
         self.tx_counts[name] = self.tx_counts.get(name, 0) + 1
 
-    def _record_event(self, text):
-        """PX4가 보낸 진단 메시지를 콘솔에 즉시 찍고, --log용으로도 남겨둔다.
-        시동 거부 사유처럼 놓치면 원인을 못 찾는 정보라 버퍼링하지 않고 바로 출력한다."""
+    def _record_event(self, text, echo=True):
+        """PX4가 보낸 진단 메시지를 콘솔에 즉시 찍는다(echo=False면 콘솔만 생략 — 5Hz
+        프로브 응답 억제용). 영구 기록은 _emit()을 통해 session_log의 events.jsonl이
+        맡고, recent_events는 짧은 최근 이력 확인용으로만 남겨둔다."""
         stamped = "%.1f %s" % (time.time(), text)
         self.recent_events.append(stamped)
-        print("[FCC] %s" % text, flush=True)
+        if echo:
+            print("[FCC] %s" % text, flush=True)
 
     def fcc_link_ok(self, timeout_s=1.5):
         """EICD-01 3.1.5절 페일세이프 판단 기준(HEARTBEAT 1.5초 미수신)과 동일 임계값."""

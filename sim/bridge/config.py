@@ -128,6 +128,19 @@ MAG_NED_GAUSS = _mag_ned_from_declination_inclination(
 REBOOT_FCC_ON_START = True
 REBOOT_FCC_ON_RESET = True
 
+# ── 세션 로깅(session_log.py) — 플래그 없이 항상 켜짐 ───────────────────────────
+# 실행마다 LOG_DIR/<YYYYMMDD_HHMMSS>[_태그]/ 에 session.json / console.log / events.jsonl /
+# snapshot.jsonl / browser.jsonl / mavlink.tlog 를 남긴다(각 파일 설명은 session_log.py).
+# `python main.py --tag hover-test` 처럼 태그를 붙이면 폴더명에 들어간다. 세션은 전부 보존
+# (지우지 않음), .gitignore로 저장소에는 올라가지 않는다.
+LOG_DIR = "logs"            # sim/bridge/ 기준 상대경로
+LOG_SNAPSHOT_HZ = 5         # snapshot.jsonl 기록 주기
+LOG_MAVLINK_TLOG = True     # 수신 MAVLink 원본을 mavlink.tlog로 기록(분당 수 MB, QGC/MAVExplorer 재생 가능)
+# 5Hz `listener actuator_motors` 프로브 응답(FDM 모터 소스)은 콘솔을 수만 줄로 채워 읽을 수
+# 없게 만든다. False면 이 프로브 응답만 콘솔에서 숨기고 events.jsonl에는 전부 남긴다.
+# commander check 등 다른 NSH 응답과 STATUSTEXT는 그대로 콘솔에 표시된다.
+CONSOLE_ECHO_ACTUATOR_PROBE = False
+
 # ── FDM 지면 충돌에 실제 지형을 쓸지 여부 — sim/py/terrain_data.json은
 # quadrotor_hud_v2.html에 임베드된 TERRAIN_DATA와 동일한 내용(meta.lat/lon 위 값과
 # 일치)이다. main.py가 이 경로로 world_model.WorldModel을 만들어 FDM에 넘긴다.
