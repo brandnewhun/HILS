@@ -1,9 +1,8 @@
 __pycache__/
 *.pyc
-bridge/__pycache__/
 
-# 브릿지 실행 로그(main.py --log 진단 JSONL, 콘솔 리다이렉트) — 세션마다 생성되는 산출물
-sim/bridge/*.log
-sim/bridge/*.jsonl
+# 브릿지 실행 로그(진단 JSONL, 콘솔 리다이렉트) — 세션마다 생성되는 산출물 (PX6C/, MICOAIR_H743/ 공통)
+*/sim/bridge/*.log
+*/sim/bridge/*.jsonl
 # 세션 로그 폴더(session_log.py) — 실행마다 생성, 전부 로컬 보존
-sim/bridge/logs/
+*/sim/bridge/logs/
