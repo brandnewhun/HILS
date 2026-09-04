@@ -1,0 +1,711 @@
+# -*- coding: utf-8 -*-
+"""
+MavlinkLink — EICD-01(FCC ↔ ENV) 물리/논리 인터페이스를 담당하는 유일한 모듈.
+pymavlink 연결 열기/heartbeat/HIL_SENSOR/HIL_GPS 송신(Channel A)과
+HIL_ACTUATOR_CONTROLS 수신(Channel B)만 다룬다. FDM이나 WebSocket 쪽은 전혀
+모른다 — main.py가 이 모듈이 만든 값을 fdm.py에 넘기고, fdm.py의 결과를 다시
+이 모듈로 넘겨 송신하는 식으로만 연결된다(모듈 간 결합을 최소화).
+
+커스텀 메시지(HIL_TILT_STATE, HIL_TILT_ACTUATOR_CONTROLS)는 표준 MAVLink
+dialect에 없다. config.CUSTOM_TILT_DIALECT_ENABLED가 True인데 실제 pymavlink에
+해당 메시지가 없으면(=아직 mavgen으로 커스텀 dialect를 만들어 붙이지 않은
+상태) 경고만 남기고 조용히 건너뛴다 — 그동안도 쿼드콥터(틸트 없음) 경로는
+완전히 정상 동작한다.
+"""
+import collections
+import inspect
+import math
+import random
+import re
+import time
+
+import geo
+
+
+# COMMAND_ACK.result 코드 -> 사람이 읽을 수 있는 이름. 시동이 거부됐을 때 그 이유를
+# 숫자가 아니라 말로 보기 위한 표다(MAV_RESULT).
+_ACK_RESULT_TEXT = {
+    0: "ACCEPTED",
+    1: "TEMPORARILY_REJECTED",
+    2: "DENIED",
+    3: "UNSUPPORTED",
+    4: "FAILED",
+    5: "IN_PROGRESS",
+    6: "CANCELLED",
+}
+
+
+# HEARTBEAT.custom_mode 상위 바이트(main_mode) -> 이름. px4_custom_mode.h의
+# PX4_CUSTOM_MAIN_MODE_* 와 같은 번호(1부터). 모드 변화 이벤트를 사람이 읽기 위함.
+_PX4_MAIN_MODE_TEXT = {
+    1: "MANUAL", 2: "ALTCTL", 3: "POSCTL", 4: "AUTO", 5: "ACRO",
+    6: "OFFBOARD", 7: "STABILIZED", 8: "RATTITUDE", 9: "SIMPLE", 10: "TERMINATION",
+}
+
+
+# SYS_STATUS의 onboard_control_sensors_* 비트 — PX4가 "이 센서가 존재하는가/켜져
+# 있는가/정상인가"를 스스로 보고하는 값이다. 시동 거부 원인을 좁힐 때, 우리가 주입한
+# 센서가 PX4 눈에 실제로 어떻게 보이는지 확인하는 용도.
+_SYS_STATUS_SENSOR_BITS = {
+    "gyro": 1 << 0,
+    "accel": 1 << 1,
+    "mag": 1 << 2,
+    "abs_pressure": 1 << 3,
+    "diff_pressure": 1 << 4,
+    "gps": 1 << 5,
+    "ahrs": 1 << 21,
+}
+
+# PX4가 HIL 센서를 등록할 때 쓰는 장치 ID(mavlink_receiver.cpp의 상수).
+# 보드 실물 센서의 ID와 다르므로, CAL_*_ID(캘리브레이션에 등록된 ID)와 비교하면
+# "PX4가 찾는 센서"와 "우리가 주입한 센서"가 같은 물건인지 판별할 수 있다.
+SIM_DEVICE_IDS = {
+    # 이 값들은 이 저장소의 PX4 소스(mavlink_receiver.cpp handle_message_hil_sensor)에서
+    # 직접 확인한 것이다. 이전에 1211382로 적어뒀던 accel/gyro 값은 틀렸고, 실기에서
+    # listener sensor_accel로 확인한 실제 device_id는 1310988이었다.
+    "accel/gyro (DRV_IMU_DEVTYPE_SIM)": 1310988,
+    "mag (DRV_MAG_DEVTYPE_MAGSIM)": 197388,
+    "baro (DRV_BARO_DEVTYPE_BAROSIM)": 6620172,
+}
+
+
+def _decode_autopilot_version(msg):
+    """AUTOPILOT_VERSION → 사람이 읽을 수 있는 dict. flight_sw_version은 PX4가
+    major<<24 | minor<<16 | patch<<8 | type 로 채우고, flight_custom_version 8바이트는
+    git 해시 앞부분이다(PX4 mavlink_messages/AUTOPILOT_VERSION.hpp)."""
+    def _semver(v):
+        v = int(v or 0)
+        return "%d.%d.%d" % ((v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF)
+
+    def _hexhash(arr):
+        try:
+            return "".join("%02x" % (int(b) & 0xFF) for b in arr)
+        except Exception:
+            return None
+
+    return {
+        "flight_sw_version": _semver(getattr(msg, "flight_sw_version", 0)),
+        "middleware_sw_version": _semver(getattr(msg, "middleware_sw_version", 0)),
+        "os_sw_version": _semver(getattr(msg, "os_sw_version", 0)),
+        "board_version": int(getattr(msg, "board_version", 0)),
+        "vendor_id": int(getattr(msg, "vendor_id", 0)),
+        "product_id": int(getattr(msg, "product_id", 0)),
+        "flight_custom_version": _hexhash(getattr(msg, "flight_custom_version", [])),
+        "uid": int(getattr(msg, "uid", 0)),
+    }
+
+
+def _clamp_unit(v):
+    return max(-1.0, min(1.0, v))
+
+
+def _send_filtered(send_fn, **kwargs):
+    """pymavlink 버전에 따라 HIL_SENSOR/HIL_GPS의 'id'(instance) 필드가 있거나
+    없을 수 있다(dialect 개정 시점 차이). send_fn이 실제로 받는 인자만 걸러서
+    호출해, 설치된 pymavlink 버전이 달라도 이 모듈을 고치지 않고 넘어가게 한다."""
+    try:
+        accepted = set(inspect.signature(send_fn).parameters.keys())
+    except (TypeError, ValueError):
+        accepted = None
+    if accepted is not None:
+        kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+    send_fn(**kwargs)
+
+
+class MavlinkLink:
+    def __init__(self, config):
+        self.config = config
+        self.conn = None
+        self._warned_no_tilt_dialect = False
+
+        # Channel B(FCC->ENV) 최신값 캐시 — recv_loop()가 갱신하고 main.py가 읽어간다.
+        self.latest_actuator = {
+            "motors": [0.0, 0.0, 0.0, 0.0],
+            "all_controls": [0.0] * 16,
+            "flags": 0,
+            "tilt_setpoint": 0.0,
+            "time_usec": 0,
+            "received": False,
+        }
+        self.last_heartbeat_from_fcc = None
+        self._fcc_armed = False
+
+        # 진단용 — 어떤 메시지가 몇 건 들어왔는지(HIL_ACTUATOR_CONTROLS가 아예 안 오는지
+        # 등을 구분), 그리고 PX4가 보낸 STATUSTEXT/COMMAND_ACK의 최근 기록.
+        self.msg_counts = {}
+        self.tx_counts = {}
+        self.last_manual_control = None
+
+        # 진단용 — PX4가 SYS_STATUS로 보고하는 센서별 present/enabled/health,
+        # 그리고 PX4가 되돌려주는 HIGHRES_IMU 최신값(우리가 주입한 값이 실제로
+        # PX4 내부까지 들어갔는지 대조하기 위함).
+        self.sys_status_sensors = {}
+        self.latest_highres_imu = {}
+        self.latest_ofp_motors = {"motors": [0.0, 0.0, 0.0, 0.0], "updated_s": 0.0}
+        self._shell_buffer = ""
+        self.recent_events = collections.deque(maxlen=40)
+
+        # 세션 로깅 훅(session_log.SessionLogger.on_link_event). main.py가 연결한다.
+        #   on_event(kind, text, **extra) — statustext / command_ack / nsh / arm_state /
+        #   mode / system_time 이벤트를 유실 없이 개별 레코드로 남기기 위함.
+        self.on_event = None
+        # 수신 MAVLink 원본을 남길 tlog 경로(main.py가 설정). connect()마다 append로
+        # 다시 붙이므로 재연결/FC 재부팅을 거쳐도 한 파일에 이어진다.
+        self.tlog_path = None
+        # HEARTBEAT에서 custom_mode/armed가 바뀐 순간을 이벤트로 남기기 위한 이전값
+        self._last_custom_mode = None
+        self._last_armed_seen = None
+        self.last_system_time = None
+        # 5Hz actuator_motors 프로브 응답 구간 추적 — 콘솔 에코 억제용(events엔 항상 기록)
+        self._nsh_in_actuator_probe = False
+        # FC 식별(보드 교체용 진단) — HEARTBEAT.autopilot/type, AUTOPILOT_VERSION.
+        # main.identify_fcc()가 채우고 session.json에 기록한다.
+        self.fcc_identity = {}
+
+    def connect(self):
+        from pymavlink import mavutil
+        c = self.config
+        self.conn = mavutil.mavlink_connection(
+            c.SERIAL_PORT,
+            baud=c.SERIAL_BAUD,
+            source_system=c.MAV_SOURCE_SYSTEM,
+            source_component=c.MAV_SOURCE_COMPONENT,
+        )
+        if self.tlog_path:
+            try:
+                # pymavlink 표준 tlog(8바이트 usec 타임스탬프 + 메시지 원본). 수신만 기록된다.
+                self.conn.setup_logfile(self.tlog_path, mode="ab")
+            except Exception as e:
+                print("[mavlink_link] tlog 기록 설정 실패(%s: %s) — 계속 진행" % (type(e).__name__, e))
+        self._emit("link", "serial connected %s" % c.SERIAL_PORT)
+        return self.conn
+
+    def _emit(self, kind, text, **extra):
+        """세션 로거로 이벤트 전달(연결 안 됐으면 무시). 로깅 실패가 브릿지를 멈추지 않게."""
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(kind, text, **extra)
+        except Exception:
+            pass
+
+    # ── Channel A: ENV -> FCC (송신) ──────────────────────────────────────────
+    def send_heartbeat(self):
+        from pymavlink import mavutil
+        self._count_tx("HEARTBEAT")
+        self.conn.mav.heartbeat_send(
+            type=mavutil.mavlink.MAV_TYPE_GCS,
+            autopilot=mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+            base_mode=0,
+            custom_mode=0,
+            system_status=mavutil.mavlink.MAV_STATE_ACTIVE,
+        )
+
+    def _mag_body_ned_fixed(self, roll, pitch, heading):
+        """ORIGIN_LAT/LON 위치의 지자기 NED 벡터(config.MAG_NED_GAUSS — OFP 펌웨어
+        자신의 WMM 참조 테이블에서 뽑은 값이라 PX4가 계산하는 기준 복각/편각과 정확히
+        일치)를 자세로 회전시켜 body 좌표로 변환한다. 예전의 고정 근사치(0.28,-0.03,
+        0.45)는 복각이 8~9° 어긋나 장시간 비행 후 "Compass needs calibration"으로
+        ARM이 거부되는 원인이었다 — 상세는 config.MAG_NED_GAUSS 주석 참조."""
+        mag_ned = self.config.MAG_NED_GAUSS
+        cr, sr = math.cos(roll), math.sin(roll)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cy, sy = math.cos(heading), math.sin(heading)
+        # NED -> body(FRD): body_to_ned의 전치(회전행렬은 직교행렬이므로 전치=역행렬)
+        r11, r12, r13 = cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr
+        r21, r22, r23 = sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr
+        r31, r32, r33 = -sp, cp * sr, cp * cr
+        n, e, d = mag_ned
+        bx = r11 * n + r21 * e + r31 * d
+        by = r12 * n + r22 * e + r32 * d
+        bz = r13 * n + r23 * e + r33 * d
+        return bx, by, bz
+
+    def send_hil_sensor(self, fdm_snapshot):
+        from pymavlink import mavutil
+        self._count_tx("HIL_SENSOR")
+        c = self.config
+        time_usec = int(time.time() * 1e6)
+        fx, fy, fz = fdm_snapshot["specific_force_body"]
+        gx, gy, gz = fdm_snapshot["p"], fdm_snapshot["q"], fdm_snapshot["r"]
+        mx, my, mz = self._mag_body_ned_fixed(
+            fdm_snapshot["roll"], fdm_snapshot["pitch"], fdm_snapshot["heading"]
+        )
+        alt_amsl = fdm_snapshot["alt"] + c.ORIGIN_ELEV_M
+        abs_pressure = geo.isa_pressure_hpa(alt_amsl)
+        temperature = geo.isa_temperature_c(alt_amsl)
+        speed = math.hypot(fdm_snapshot["vN"], fdm_snapshot["vE"])
+        diff_pressure = 0.5 * 1.225 * speed * speed / 100.0  # 대략치(hPa), [TBD-ADS 센서사양]
+
+        # FDM은 수식 그대로의 "완벽한" 값을 내놓는데, 정지 상태에서는 그게 연속으로
+        # 완전히 동일해져 PX4 DataValidator가 STALE(고장난 센서)로 오판한다
+        # (config.SENSOR_NOISE 주석 및 원인 설명 참조). 실제 센서 잡음 수준의 작은
+        # 가우시안 노이즈를 더해 "항상 조금씩 다른 값"으로 만든다.
+        n = c.SENSOR_NOISE
+        fx += random.gauss(0.0, n["accel_mss"])
+        fy += random.gauss(0.0, n["accel_mss"])
+        fz += random.gauss(0.0, n["accel_mss"])
+        gx += random.gauss(0.0, n["gyro_rads"])
+        gy += random.gauss(0.0, n["gyro_rads"])
+        gz += random.gauss(0.0, n["gyro_rads"])
+        mx += random.gauss(0.0, n["mag_gauss"])
+        my += random.gauss(0.0, n["mag_gauss"])
+        mz += random.gauss(0.0, n["mag_gauss"])
+        abs_pressure += random.gauss(0.0, n["baro_hpa"])
+
+        fields_updated = getattr(mavutil.mavlink, "HIL_SENSOR_UPDATED_FLAGS_ALL", 0x1FFF)
+
+        _send_filtered(
+            self.conn.mav.hil_sensor_send,
+            time_usec=time_usec,
+            xacc=fx, yacc=fy, zacc=fz,
+            xgyro=gx, ygyro=gy, zgyro=gz,
+            xmag=mx, ymag=my, zmag=mz,
+            abs_pressure=abs_pressure,
+            diff_pressure=diff_pressure,
+            pressure_alt=alt_amsl,
+            temperature=temperature,
+            fields_updated=fields_updated,
+            id=0,
+        )
+
+    def send_hil_gps(self, fdm_snapshot):
+        self._count_tx("HIL_GPS")
+        c = self.config
+        time_usec = int(time.time() * 1e6)
+        lat, lon = geo.ned_to_latlon(
+            fdm_snapshot["north"], fdm_snapshot["east"], c.ORIGIN_LAT_DEG, c.ORIGIN_LON_DEG
+        )
+        alt_amsl = fdm_snapshot["alt"] + c.ORIGIN_ELEV_M
+        vn_cms = int(max(-32000, min(32000, fdm_snapshot["vN"] * 100)))
+        ve_cms = int(max(-32000, min(32000, fdm_snapshot["vE"] * 100)))
+        vd_cms = int(max(-32000, min(32000, fdm_snapshot["vD"] * 100)))
+        speed_cms = int(math.hypot(fdm_snapshot["vN"], fdm_snapshot["vE"]) * 100)
+        cog_cdeg = int((math.degrees(math.atan2(fdm_snapshot["vE"], fdm_snapshot["vN"])) % 360) * 100)
+
+        _send_filtered(
+            self.conn.mav.hil_gps_send,
+            time_usec=time_usec,
+            fix_type=3,
+            lat=int(lat * 1e7),
+            lon=int(lon * 1e7),
+            alt=int(alt_amsl * 1000),
+            eph=100, epv=100,
+            vel=speed_cms,
+            vn=vn_cms, ve=ve_cms, vd=vd_cms,
+            cog=cog_cdeg,
+            satellites_visible=10,
+            id=0,
+        )
+
+    def send_hil_tilt_state(self, fdm_snapshot):
+        """커스텀 메시지 — mavgen으로 생성한 dialect가 conn.mav에 붙어있을 때만 전송.
+        아직 없으면 최초 1회만 경고를 남기고 이후로는 조용히 건너뛴다."""
+        if not self.config.CUSTOM_TILT_DIALECT_ENABLED:
+            return
+        send_fn = getattr(self.conn.mav, "hil_tilt_state_send", None)
+        if send_fn is None:
+            if not self._warned_no_tilt_dialect:
+                print(
+                    "[mavlink_link] CUSTOM_TILT_DIALECT_ENABLED=True 지만 pymavlink에 "
+                    "hil_tilt_state_send()가 없습니다 — PX4 커스텀 펌웨어 저장소의 "
+                    "메시지 정의(XML)를 mavgen으로 생성해 연결하기 전까지 틸트 상태는 "
+                    "전송하지 않습니다(쿼드콥터 경로에는 영향 없음)."
+                )
+                self._warned_no_tilt_dialect = True
+            return
+        tilt_deg = fdm_snapshot["tilt"] * 90.0
+        send_fn(
+            time_usec=int(time.time() * 1e6),
+            angle=[tilt_deg, tilt_deg, tilt_deg, tilt_deg],
+            angular_velocity=[0.0, 0.0, 0.0, 0.0],
+            current_ma=[0, 0, 0, 0],
+            temperature_c=[25.0, 25.0, 25.0, 25.0],
+        )
+
+    # ── Channel D: ENV -> FCC (조종기 입력, RC_CHANNELS_OVERRIDE) ───────────────
+    # rc_values는 rc_source.RcSource.read()가 주는 {"pitch","roll","yaw","thr","tilt"}
+    # (-1..1 정규화값) — 이 값이 스크립트/키보드/실제 외부 송신기 중 어디서 왔는지는
+    # 여기서 전혀 모른다(main.py가 RcSource를 통해서만 넘겨준다).
+    #
+    # ★ 확인 필요 ★ chan5_raw(tilt)의 실제 채널 번호는 OFP의 RC_MAP_AUX* 파라미터
+    # (또는 tv_control_allocator가 참조하는 커스텀 매핑)와 반드시 대조할 것 — 여기서는
+    # "5번 채널"을 잠정값으로 썼을 뿐이다. pitch/roll/yaw/thr(1~4번)는 PX4 기본 RC_MAP_*
+    # 채널 배정(RC_MAP_ROLL=1, RC_MAP_PITCH=2, RC_MAP_THROTTLE=3, RC_MAP_YAW=4)을 그대로
+    # 따른 것이라 이 넷은 바뀔 일이 거의 없다.
+    #
+    # thr(스로틀)도 1500(중립)을 기준으로 -1..1을 매핑한다 — 이 브릿지가 시뮬레이팅하는
+    # 비행모드(HILS_ICD/sim/quadrotor_hud.html의 climbRate 모델)는 "중립=고도유지,
+    # +면 상승/-면 하강"인 자세/고도제어 모드 기준이라, 0=최소추력(정지)인 완전 수동
+    # ACRO/STABILIZED 스로틀 관례와는 다르다 — 실제 비행모드가 바뀌면 이 매핑도 재검토.
+    RC_CHANNEL_IGNORE = 65535  # MAVLink 관례: 이 값을 넣은 채널은 "오버라이드 안 함"
+
+    @staticmethod
+    def _rc_to_pwm(value, center=1500, span=500):
+        return int(max(1000, min(2000, center + _clamp_unit(value) * span)))
+
+    def send_rc_override(self, rc_values):
+        self._count_tx("RC_CHANNELS_OVERRIDE")
+        ignore = self.RC_CHANNEL_IGNORE
+        self.conn.mav.rc_channels_override_send(
+            target_system=getattr(self.conn, "target_system", 1) or 1,
+            target_component=getattr(self.conn, "target_component", 1) or 1,
+            chan1_raw=self._rc_to_pwm(rc_values.get("roll", 0.0)),
+            chan2_raw=self._rc_to_pwm(rc_values.get("pitch", 0.0)),
+            chan3_raw=self._rc_to_pwm(rc_values.get("thr", 0.0)),
+            chan4_raw=self._rc_to_pwm(rc_values.get("yaw", 0.0)),
+            chan5_raw=self._rc_to_pwm(rc_values.get("tilt", 0.0)),  # ★ 확인 필요 ★ 채널 번호
+            chan6_raw=ignore, chan7_raw=ignore, chan8_raw=ignore,
+        )
+
+    def send_manual_control(self, rc_values):
+        """브라우저의 -1..1 입력을 PX4 joystick(MANUAL_CONTROL)으로 송신한다.
+
+        x/y/r(pitch/roll/yaw)는 PX4가 그대로 ``/1000.f``만 해서 쓰므로 -1000..1000이
+        맞다. 하지만 z(throttle)는 다르다 — 펌웨어(mavlink_receiver.cpp
+        handle_message_manual_control)가 명시적으로 "backwards compatibility"로
+        z를 **0..1000**으로 기대하고 ``(z/1000)*2 - 1``로 내부 -1..1로 바꾼다.
+        예전 코드는 z도 다른 축처럼 -1000..1000으로 보내서, 중립(0)이 throttle=-1.0
+        (완전 컷오프)로, 아래쪽 끝(-1000)이 throttle=-3.0(스펙 밖 값)으로 해석되고
+        있었다 — 실기에서 ARM은 되는데 스로틀을 줘도 거의 안 움직이던 원인.
+        """
+        def to_1000_signed(key):
+            return int(round(_clamp_unit(rc_values.get(key, 0.0)) * 1000))
+
+        def throttle_to_1000(key):
+            unit = _clamp_unit(rc_values.get(key, 0.0))  # -1..1
+            return int(round(((unit + 1.0) / 2.0) * 1000))  # -1..1 -> 0..1000
+
+        self._count_tx("MANUAL_CONTROL")
+        x, y, r = (to_1000_signed("pitch"), to_1000_signed("roll"), to_1000_signed("yaw"))
+        z = throttle_to_1000("thr")
+        self.conn.mav.manual_control_send(
+            getattr(self.conn, "target_system", 1) or 1,
+            x, y, z, r,
+            0,
+        )
+        self.last_manual_control = {"x": x, "y": y, "z": z, "r": r}
+
+    # ★ 버그 수정(2026-09-04) ★ 이전 값 1<<16(=65536)은 HEARTBEAT.custom_mode
+    # 필드의 인코딩(px4_custom_mode.h의 union: main_mode가 16비트 시프트된 자리에
+    # 옴)과 착각한 값이었다. 하지만 MAV_CMD_DO_SET_MODE의 param2는 그 인코딩이
+    # 아니라 Commander.cpp(handle_command)가 `(uint8_t)cmd.param2`로 그대로 읽는
+    # "생 main_mode 값"이다 — PX4 자신의 `commander mode manual` NSH 구현도
+    # send_vehicle_command(DO_SET_MODE, 1, PX4_CUSTOM_MAIN_MODE_MANUAL /*=1*/)로
+    # param2에 1을 넣는다. 65536을 uint8_t로 캐스팅하면 0이 되어 버려 MANUAL(1)/
+    # POSCTL(3) 등 어떤 main_mode와도 안 맞았고, 그 결과 모드 전환 자체가 무시되어
+    # 실기가 계속 POSCTL에 머물렀다(vehicle_status.nav_state 실측으로 확인) — OFP
+    # 결함이 아니라 이 브릿지의 값 착각이었다.
+    PX4_CUSTOM_MODE_MANUAL = 1
+
+    def send_set_manual_mode(self):
+        """MANUAL 비행모드로 전환한다(MAV_CMD_DO_SET_MODE).
+
+        이 기체 전용 자세제어 모듈(tv_att_control/TiltVtolAttitudeControl.cpp)은
+        ``vehicle_status.nav_state == NAVIGATION_STATE_MANUAL``일 때만 스틱
+        스로틀(``manual_control_setpoint.throttle``)을 그대로 추력 명령으로
+        쓴다 — 그 외 모드에서는 위치/자세 컨트롤러가 계산한
+        ``vehicle_attitude_setpoint.thrust_body[2]``를 쓰는데, 이건 유효한
+        위치/속도 추정치가 있어야 의미 있는 값을 낸다. 실기 로그에서 스로틀을
+        끝까지 눌러도 모터가 노이즈 수준(<0.001)에서 안 움직인 게 이 경로 때문
+        이었다 — 정작 그 순간 "velocity/position estimate error"가 계속
+        떠 있었다. MANUAL 모드로 두면 이 EKF 의존성을 완전히 우회해 스틱이
+        바로 반영된다(HIL 배선 자체를 검증하려는 지금 목적에 맞음). OFP는
+        안 건드림 — 브릿지가 시작 시 한 번, ARM 요청 때마다 한 번씩 요청만
+        보낸다(다른 프로세스가 모드를 바꿔도 곧 다시 맞춰짐).
+        """
+        from pymavlink import mavutil
+        self._count_tx("SET_MODE")
+        self.conn.mav.command_long_send(
+            getattr(self.conn, "target_system", 1) or 1,
+            getattr(self.conn, "target_component", 1) or 1,
+            mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+            0,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            self.PX4_CUSTOM_MODE_MANUAL,
+            0, 0, 0, 0, 0,
+        )
+
+    # Commander.cpp: "Arm is forced (checks skipped) when param2 is set to a magic
+    # number." disarm(reason, forced)에서 forced=False(기본)면 착륙 판정(landed-
+    # detector) 등 정상 비행 안전조건을 통과해야 disarm이 먹힌다 — 그런데 HIL FDM은
+    # 실제 착지 감지 신호가 없고, 자세가 흐트러진 채로 몇 초 놔두면 PX4가 "아직
+    # 비행 중"으로 보고 일반 DISARM을 계속 TEMPORARILY_REJECTED로 거부한다(실기로
+    # 재현 확인). 벤치 HIL 테스트에서는 그때그때 바로 멈출 수 있어야 하므로, DISARM만
+    # 이 매직넘버로 강제 처리한다(ARM은 그대로 둬 정상 안전검사를 계속 받게 함).
+    ARM_DISARM_FORCE_MAGIC = 21196
+
+    def send_arm(self, armed):
+        """시동/시동해제 명령(MAV_CMD_COMPONENT_ARM_DISARM).
+
+        HIL 모드(SYS_HITL=1)에서는 실제 모터 PWM이 나가지 않고 HIL_ACTUATOR_CONTROLS
+        메시지로 대체되므로, 여기서 ARM을 걸어도 프로펠러가 돌지 않는다. 하지만 ARM을
+        안 하면 PX4가 액추에이터 출력을 전부 0으로 막기 때문에, FDM에 들어가는 추력이
+        0이 되어 기체가 전혀 움직이지 않는다 — HIL에서 움직임을 보려면 반드시 필요하다.
+        """
+        from pymavlink import mavutil  # 이 파일의 다른 메서드들과 같은 지역 import 관례
+
+        self._count_tx("ARM_CMD")
+        self.conn.mav.command_long_send(
+            getattr(self.conn, "target_system", 1) or 1,
+            getattr(self.conn, "target_component", 1) or 1,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,                          # confirmation
+            1.0 if armed else 0.0,      # param1: 1=arm, 0=disarm
+            0.0 if armed else float(self.ARM_DISARM_FORCE_MAGIC),  # param2
+            0, 0, 0, 0, 0,
+        )
+
+    # ── Channel B: FCC -> ENV (수신) ──────────────────────────────────────────
+    def poll_incoming(self, on_telemetry_message=None):
+        """넌블로킹으로 대기 중인 메시지를 전부 처리한다. main.py의 루프에서 매 틱 호출.
+        on_telemetry_message(msg)는 (선택) Channel C를 "브릿지 FDM 진실값" 대신
+        "Pixhawk 자체 EKF2 추정치"로 보고 싶을 때 GLOBAL_POSITION_INT 등을 넘겨받는 훅."""
+        while True:
+            msg = self.conn.recv_match(blocking=False)
+            if msg is None:
+                break
+            mtype = msg.get_type()
+            self.msg_counts[mtype] = self.msg_counts.get(mtype, 0) + 1
+
+            # PX4가 "왜 안 되는지"를 말해주는 두 메시지 — QGC를 안 쓰면 아무도 안 듣게
+            # 되므로 여기서 잡아 바로 콘솔에 찍는다. 시동 거부 사유("Arming denied: ...",
+            # "Preflight Fail: ...")가 대부분 여기로 나온다.
+            if mtype == "STATUSTEXT":
+                text = getattr(msg, "text", "")
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", "replace")
+                text = text.strip("\x00").strip()
+                if text:
+                    sev = getattr(msg, "severity", "?")
+                    self._record_event("STATUSTEXT[sev=%s] %s" % (sev, text))
+                    self._emit("statustext", text, severity=sev)
+                continue
+            if mtype == "SERIAL_CONTROL":
+                # NSH 셸 응답 조각 -- send_shell_cmd()로 보낸 명령의 출력이 여러 조각으로
+                # 쪼개져 돌아온다. 줄 단위로 모아서 완성된 줄만 이벤트로 남긴다.
+                n = getattr(msg, "count", 0)
+                text = bytes(msg.data[:n]).decode("utf-8", "replace")
+                self._shell_buffer += text
+                while "\n" in self._shell_buffer:
+                    line, self._shell_buffer = self._shell_buffer.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        # NSH ``listener actuator_motors``의 실제 OFP control allocator
+                        # 출력. HIL_ACTUATOR_CONTROLS의 현 OFP 채널 배치가 표준 모터
+                        # 배열과 달라 임시 SIM 어댑터가 이 값을 FDM에 사용한다.
+                        match = re.search(r"control:\s*\[([^\]]+)\]", line)
+                        if match:
+                            try:
+                                values = [float(v.strip()) for v in match.group(1).split(",")]
+                                if len(values) >= 4:
+                                    self.latest_ofp_motors = {
+                                        "motors": values[:4], "updated_s": time.time()
+                                    }
+                            except ValueError:
+                                pass
+                        # 5Hz actuator_motors 프로브 응답 구간(명령 에코 ~ reversible_flags)만
+                        # 콘솔 에코를 억제할 수 있다(config.CONSOLE_ECHO_ACTUATOR_PROBE).
+                        # events.jsonl에는 항상 남긴다.
+                        if "listener actuator_motors" in line:
+                            self._nsh_in_actuator_probe = True
+                        echo = getattr(self.config, "CONSOLE_ECHO_ACTUATOR_PROBE", True) or not self._nsh_in_actuator_probe
+                        self._record_event("NSH: %s" % line, echo=echo)
+                        self._emit("nsh", line, probe=self._nsh_in_actuator_probe)
+                        if self._nsh_in_actuator_probe and line.startswith("reversible_flags"):
+                            self._nsh_in_actuator_probe = False
+                continue
+            if mtype == "COMMAND_ACK":
+                result = getattr(msg, "result", None)
+                cmd = getattr(msg, "command", "?")
+                self._record_event(
+                    "COMMAND_ACK cmd=%s result=%s(%s)" % (cmd, result, _ACK_RESULT_TEXT.get(result, "?"))
+                )
+                self._emit("command_ack", _ACK_RESULT_TEXT.get(result, "?"), command=cmd, result=result)
+                continue
+            if mtype == "SYSTEM_TIME":
+                # FC 부팅시각(time_boot_ms) <-> Unix 시각 매핑. FC의 ulog 타임스탬프(부팅
+                # 기준 us)를 PC 시각/이 세션의 t로 환산할 때 필요. 처음 1회만 이벤트로.
+                mapping = {
+                    "fc_time_unix_usec": int(getattr(msg, "time_unix_usec", 0)),
+                    "fc_time_boot_ms": int(getattr(msg, "time_boot_ms", 0)),
+                    "pc_time_unix": time.time(),
+                }
+                if self.last_system_time is None:
+                    self._emit("system_time", "first SYSTEM_TIME", **mapping)
+                self.last_system_time = mapping
+                continue
+
+            if mtype == "SYS_STATUS":
+                present = getattr(msg, "onboard_control_sensors_present", 0)
+                enabled = getattr(msg, "onboard_control_sensors_enabled", 0)
+                health = getattr(msg, "onboard_control_sensors_health", 0)
+                self.sys_status_sensors = {
+                    name: {
+                        "present": bool(present & bit),
+                        "enabled": bool(enabled & bit),
+                        "health": bool(health & bit),
+                    }
+                    for name, bit in _SYS_STATUS_SENSOR_BITS.items()
+                }
+                continue
+            if mtype == "HIGHRES_IMU":
+                self.latest_highres_imu = {
+                    "xacc": getattr(msg, "xacc", None),
+                    "yacc": getattr(msg, "yacc", None),
+                    "zacc": getattr(msg, "zacc", None),
+                    "xmag": getattr(msg, "xmag", None),
+                    "ymag": getattr(msg, "ymag", None),
+                    "zmag": getattr(msg, "zmag", None),
+                    "abs_pressure": getattr(msg, "abs_pressure", None),
+                    "temperature": getattr(msg, "temperature", None),
+                }
+                continue
+
+            if mtype == "HEARTBEAT":
+                # 이 연결은 FCC 1대와의 점대점(serial) 링크이므로, 여기 들어오는
+                # HEARTBEAT는 항상 FCC가 보낸 것이다(수신 쪽에는 우리 자신이 보낸
+                # HEARTBEAT가 되돌아올 경로가 없음 — sysid로 걸러낼 필요가 없고,
+                # 걸러내면 오히려 PX4 기본 sysid(=1)가 우리 쪽 기본값과 같을 때
+                # 헬스체크가 항상 실패하는 버그가 된다).
+                self.last_heartbeat_from_fcc = time.time()
+                if "autopilot" not in self.fcc_identity:
+                    # 첫 HEARTBEAT에서 오토파일럿 종류(PX4=12, ArduPilot=3)와 기체형(MAV_TYPE)을
+                    # 잡아둔다 — Micoair 보드는 출고 시 ArduPilot이라 이걸로 바로 구분된다.
+                    self.fcc_identity["autopilot"] = int(getattr(msg, "autopilot", -1))
+                    self.fcc_identity["mav_type"] = int(getattr(msg, "type", -1))
+                    self.fcc_identity["sysid"] = int(msg.get_srcSystem())
+                    self.fcc_identity["compid"] = int(msg.get_srcComponent())
+                    self._emit("fcc_identity", "first HEARTBEAT", **self.fcc_identity)
+                # MAV_MODE_FLAG_SAFETY_ARMED(0x80) 비트로 실제 Arm 여부를 판정한다.
+                # (이전 버전은 "액추에이터 메시지를 한 번이라도 받았는가"를 armed로
+                # 오인했는데, PX4는 Disarm 상태에서도 HIL_ACTUATOR_CONTROLS를 계속
+                # 보내므로 그 플래그는 한 번 true가 되면 계속 true로 고정되는 버그였음.)
+                self._fcc_armed = bool(msg.base_mode & 0x80)
+                # armed / custom_mode(main_mode=상위 바이트, PX4_CUSTOM_MAIN_MODE_*)가 바뀐
+                # 순간만 이벤트로 — "언제 MANUAL에서 POSCTL로 돌아갔나" 같은 걸 추적하기 위함.
+                if self._fcc_armed != self._last_armed_seen:
+                    self._emit("arm_state", "ARMED" if self._fcc_armed else "DISARMED", armed=self._fcc_armed)
+                    self._last_armed_seen = self._fcc_armed
+                custom_mode = int(getattr(msg, "custom_mode", 0))
+                if custom_mode != self._last_custom_mode:
+                    main_mode = (custom_mode >> 16) & 0xFF
+                    sub_mode = (custom_mode >> 24) & 0xFF
+                    self._emit("mode", _PX4_MAIN_MODE_TEXT.get(main_mode, "main_mode=%d" % main_mode),
+                               custom_mode=custom_mode, main_mode=main_mode, sub_mode=sub_mode)
+                    self._last_custom_mode = custom_mode
+            elif mtype == "AUTOPILOT_VERSION":
+                self.fcc_identity.update(_decode_autopilot_version(msg))
+                self._emit("fcc_identity", "AUTOPILOT_VERSION", **self.fcc_identity)
+            elif mtype == "HIL_ACTUATOR_CONTROLS":
+                controls = list(msg.controls)
+                self.latest_actuator["motors"] = controls[0:4]
+                self.latest_actuator["all_controls"] = controls
+                self.latest_actuator["flags"] = getattr(msg, "flags", 0)
+                self.latest_actuator["time_usec"] = msg.time_usec
+                self.latest_actuator["received"] = True
+            elif mtype == "HIL_TILT_ACTUATOR_CONTROLS":
+                # 커스텀 다이얼렉트가 붙어있으면 자동으로 여기 잡힌다(별도 등록 불필요).
+                angles = list(getattr(msg, "angle", [0.0, 0.0, 0.0, 0.0]))
+                self.latest_actuator["tilt_setpoint"] = (sum(angles) / len(angles)) / 90.0 if angles else 0.0
+            elif on_telemetry_message is not None:
+                on_telemetry_message(msg)
+
+    def send_shell_cmd(self, text):
+        """QGC의 "MAVLink Console"과 같은 프로토콜(SERIAL_CONTROL_DEV_SHELL)로 NSH에
+        명령 1건을 보낸다 — sim/py/mavlink_shell.py와 동일 구현. 응답은 이 함수가 직접
+        기다리지 않는다(넌블로킹) — poll_incoming()이 다른 메시지들처럼 그때그때
+        받아서 recent_events에 쌓아준다(SERIAL_CONTROL 처리 참조)."""
+        from pymavlink import mavutil
+        dev_shell = mavutil.mavlink.SERIAL_CONTROL_DEV_SHELL
+        flags = (
+            mavutil.mavlink.SERIAL_CONTROL_FLAG_RESPOND
+            | mavutil.mavlink.SERIAL_CONTROL_FLAG_EXCLUSIVE
+            | mavutil.mavlink.SERIAL_CONTROL_FLAG_MULTI
+        )
+        data = (text + "\n").encode("ascii", "replace")
+        for i in range(0, len(data), 70):
+            chunk = data[i:i + 70]
+            padded = chunk + b"\x00" * (70 - len(chunk))
+            self.conn.mav.serial_control_send(dev_shell, flags, 0, 0, len(chunk), list(padded))
+
+    def request_autopilot_version(self):
+        """MAV_CMD_REQUEST_MESSAGE(512)로 AUTOPILOT_VERSION(148) 1건을 요청한다. 응답은
+        poll_incoming()이 받아 fcc_identity에 채운다(펌웨어 버전·보드 ID·git 해시)."""
+        from pymavlink import mavutil
+        self.conn.mav.command_long_send(
+            getattr(self.conn, "target_system", 1) or 1,
+            getattr(self.conn, "target_component", 1) or 1,
+            mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE, 0,
+            mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION, 0, 0, 0, 0, 0, 0,
+        )
+
+    def read_param(self, name, timeout=3.0):
+        """파라미터 1개를 읽는다(없거나 응답이 없으면 None).
+
+        진단 목적: CAL_ACC0_ID 등 "PX4가 캘리브레이션에 등록해둔 장치 ID"를 읽어서,
+        우리가 주입한 시뮬레이션 센서의 장치 ID(SIM_DEVICE_IDS)와 비교하기 위함.
+        둘이 다르면 PX4는 "내가 찾는 그 센서가 데이터를 안 준다"고 판단해
+        'No valid data from Accel 0' 로 시동을 거부한다.
+        """
+        self.conn.mav.param_request_read_send(
+            getattr(self.conn, "target_system", 1) or 1,
+            getattr(self.conn, "target_component", 1) or 1,
+            name.encode("ascii"), -1,
+        )
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.conn.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.3)
+            if msg is None:
+                continue
+            if msg.param_id.strip("\x00") == name:
+                return msg.param_value
+        return None
+
+    def _count_tx(self, name):
+        """ENV -> FCC 송신 건수. 로그에서 '보내긴 했는가'를 '받았는가'와 나눠 보기 위함."""
+        self.tx_counts[name] = self.tx_counts.get(name, 0) + 1
+
+    def _record_event(self, text, echo=True):
+        """PX4가 보낸 진단 메시지를 콘솔에 즉시 찍는다(echo=False면 콘솔만 생략 — 5Hz
+        프로브 응답 억제용). 영구 기록은 _emit()을 통해 session_log의 events.jsonl이
+        맡고, recent_events는 짧은 최근 이력 확인용으로만 남겨둔다."""
+        stamped = "%.1f %s" % (time.time(), text)
+        self.recent_events.append(stamped)
+        if echo:
+            print("[FCC] %s" % text, flush=True)
+
+    def fcc_link_ok(self, timeout_s=1.5):
+        """EICD-01 3.1.5절 페일세이프 판단 기준(HEARTBEAT 1.5초 미수신)과 동일 임계값."""
+        if self.last_heartbeat_from_fcc is None:
+            return False
+        return (time.time() - self.last_heartbeat_from_fcc) < timeout_s
+
+    def is_armed(self):
+        """가장 최근 HEARTBEAT의 MAV_MODE_FLAG_SAFETY_ARMED 비트. HEARTBEAT를 아직
+        한 번도 못 받았으면(따라서 fcc_link_ok()도 False) 항상 False."""
+        return self._fcc_armed and self.fcc_link_ok()
+
+    def sim_motors(self, source_mode):
+        """FDM이 사용할 모터 벡터를 선택한다.
+
+        ``nsh_actuator_motors``는 OFP 수정 전의 임시 검증 경로다. ``listener
+        actuator_motors``가 읽는 값은 자세제어기가 "지금 이 자세라면 이렇게
+        출력하겠다"고 계속 계산하는 내부 제어 노력값이라, PX4 자신의 arm
+        상태와 무관하게 항상 갱신된다(TERMINATION/디스암 상태에서 이 값이
+        계속 흔들리는 게 실측으로 확인됨). 최종 실물 출력(actuator_outputs)은
+        PX4가 알아서 armed일 때만 내보내지만, 우리는 그 안전 게이트를 우회해서
+        읽는 셈이므로 여기서 반드시 직접 armed를 확인해야 한다 — 안 그러면
+        DISARM 상태에서도 FDM이 계속 움직이는 버그가 된다(실제로 발생했었음).
+        새 uORB 스냅샷이 1초 이상 안 들어오면 안전하게 0을 반환해 오래된
+        추력이 남지 않게 한다.
+        """
+        if source_mode == "hil_controls":
+            return list(self.latest_actuator["motors"])
+        if source_mode == "nsh_actuator_motors":
+            if not self.is_armed():
+                return [0.0, 0.0, 0.0, 0.0]
+            if time.time() - self.latest_ofp_motors["updated_s"] <= 1.0:
+                return list(self.latest_ofp_motors["motors"])
+            return [0.0, 0.0, 0.0, 0.0]
+        raise ValueError("알 수 없는 MOTOR_SOURCE_MODE: %r" % source_mode)

@@ -1,0 +1,1745 @@
+<!--
+====================================================================
+ Quadrotor HUD — HILS 시각화 시뮬레이터 (Airbility)
+ 파일: HILS_ICD/sim/quadrotor_hud.html
+ 대상 사이트: 37.279086N, 127.103447E (용인시 기흥구), 500m x 500m
+
+ 변경 이력 (Changelog)
+ --------------------------------------------------------------
+ v1  최초 2D HUD 프로토타입 (속도/고도/헤딩 텍스트 표시)
+ v2  Three.js 기반 3D 렌더링으로 전환, 키보드 조종 추가
+ v3  실제 지형(SRTM 30m, 500m 박스) 반영
+ v4  실제 도로(OSM Overpass) + 건물 반영, 도로 클리핑 버그 수정
+     (박스 경계 clip을 Liang-Barsky 알고리즘으로 교체 — 고속도로
+     등 일부 폴리라인이 끊겨 보이던 문제 해결)
+ v5  건물 실측 높이 반영 (AL_D198/AL_D199 건축물대장, 54개 동)
+ v6  지형/건물/도로 전 구간 충돌 처리, 최대 고도 200m 제한,
+     HUD 정보 재배치 (HDG를 상단 배경 표기에서 하단 기체 정보
+     클러스터로 이동: HDG/Roll/Pitch/Tilt, Alt/Speed 순)
+     ※ 이 프로젝트의 모든 대기 관련 계산은 별도 언급이 없는 한
+       표준대기(ISA)를 기본값으로 사용
+ v7  WorldModel / Vehicle / FlightSim / Renderer 모듈 구조로 리팩터링
+     (병행 세션 작업 — 쿼드로터/틸트로터 기체 팩토리 분리)
+ v8  TargetDrone 모듈 추가 — 추격 대상 드론
+     - 좌하단 UI에서 형상(쿼드콥터/고정익) 및 모드(자동/수동) 선택
+     - 등속 최대 50m/s, 형상별 별도 운동 모델(쿼드: 자유 방향 전환,
+       고정익: 뱅크 선회 + 실속속도 하한)
+     - 자동 모드: 맵 경계 내 임의 목표점 재설정(에지 바이어스 조향)
+     - 수동 모드: 별도 키(J/L/I/K/U/O)로 직접 조종
+     - 기본 비행 특성은 TARGET_PROFILES에 상수로 분리해 추후 튜닝 용이
+     - 렌더러에 setTargetGeometry/updateTargetFromState 계약 추가
+       (기존 자기 기체 렌더링 파이프라인과 독립적으로 동작)
+ v9  파일 상단 변경 이력 주석 추가
+ v10 지형/도로/건물 경계 자연스럽게 개선
+     - 건물: footingY(footprint 내 최저 지형고도)까지 기초를 파묻는 스커트 추가
+       → 경사지에서 건물 밑면과 지형 사이 틈이 보이던 문제 해결(시각 전용,
+         충돌 판정에 쓰이는 baseY/roof는 그대로 유지)
+     - 도로: 세그먼트 양 끝점 높이를 각각 반영해 두께/위치 계산
+       → 경사면에서 도로 한쪽이 뜨거나 파묻히던 현상 완화
+     - 도로 재질을 MeshBasicMaterial → MeshStandardMaterial로 교체
+       → 기존엔 조명을 안 받아 시간대와 무관하게 항상 같은 밝기로 떠 보였음
+ v11 위 v10 수정이 실제로는 불완전했던 두 가지 문제를 근본적으로 재수정
+     - 도로: BoxGeometry(세그먼트별 독립 두께/중심고도) → 양 끝점 높이를 정점에
+       그대로 고정하는 쐐기형(ramp) 커스텀 지오메트리로 교체.
+       기존 방식은 두 끝점 높이차가 큰 구간(예: 13.5m 고저차)에서 두께가
+       그만큼 두꺼워져 도로가 "벽"처럼 솟아 보이고, 이웃 세그먼트끼리 만나는
+       지점의 높이가 서로 달라 도로가 계단처럼 끊겨 보이는 원인이었음.
+       ramp 방식은 두께가 항상 일정하고 이웃 세그먼트와 정확히 같은 높이에서
+       만나므로 두 문제 모두 해결.
+     - 건물: footingY 계산이 footprint 코너만 샘플링해서, 건물 바로 바깥쪽
+       지형이 코너보다 더 낮게 꺼지는 경우 스커트가 그 저점까지 못 미쳐
+       밑면에 틈(배경이 비치는 구멍)이 보이던 문제 → 각 코너 바깥쪽
+       지점(centroid 기준 1.3배 확장)도 함께 샘플링하고 여유 마진을
+       0.25m → 0.6m로 확대.
+     - 지형 정점 컬러에 도로/건물 근접 접지음영(AO) 블렌딩 추가
+       → 그림자가 없어도 도로/건물이 지면과 맞닿는 경계가 또렷하게 보이도록 함
+     - DirectionalLight(sun) 실시간 그림자(shadow map) 활성화
+       → 건물이 지형에 실제 그림자를 드리워 훨씬 자연스럽게 "붙어" 보임
+ v12 건물 밑동 틈 근본 해결 + 실제 고가도로 표현
+     - 건물: v11의 footingY 스커트는 "지형 정점"을 건드리지 않고 건물 쪽만
+       파묻는 방식이라, 지형 그리드 정점 간격(수~수십m)보다 작은 건물에서는
+       코너 사이 지형 저점을 여전히 놓칠 수 있었음(실측 확인: 5m 크기 건물).
+       → 벽체보다 넓게 확장한 기초(plinth)를 별도로 덧붙이는 방식으로 교체.
+         실제 건축에서 기초가 벽체보다 넓게 나가는 것과 같은 원리로, 지형
+         그리드 해상도와 무관하게 벽 바로 밑 틈을 가린다(outsetPolygon()).
+       ※ 건물 자체에 "그 위치의 지형고도" 데이터가 별도로 있는 게 아니라
+         baseY도 결국 SRTM 기반 sampleHeight()로 추정한 값이라, 건물/지형
+         데이터를 더 정밀하게 맞추려면 건물 대지 자체의 실측 표고 데이터가
+         필요함 — 현재는 이 여유 폭(1.8m)으로 그 오차를 흡수하는 방식.
+     - 도로: Overpass 원본(_terrain_raw/overpass_result.json)에 도로 태그가
+       살아있었음을 확인 — 그 중 "신갈제1고가차도"가 bridge=yes로 명시된
+       실제 고가도로였음. 좌표 시그니처로 재식별해 상판을 지형+교량여유고
+       (5.5m)만큼 띄우고 교각(pier)을 세워 고가도로로 표현. 충돌 판정은
+       의도적으로 지면 높이 그대로 둬서 다리 밑 공간은 계속 비행 가능
+       (상판에 정확히 착지하는 것은 별도 모델링하지 않음).
+       작은 배수로 교량 3곳은 인접 도로 조각과 겹쳐 좌표만으로 특정하기
+       어렵고 시각적 영향도 미미해 이번엔 반영하지 않음.
+ v13 v12까지도 여전히 "건물/고가도로가 허공에 떠 보인다"는 신고가 반복돼,
+     레이캐스트로 직접 검증
+     ※ 결론: 지오메트리 틈은 없었음. Three.js Raycaster로 화면상 "빈 공간"처럼
+       보이던 지점을 쏴 봤더니 전부 지형 메쉬에 명중 — 즉 건물/데이터 문제가
+       아니라 순전히 "너무 어두워서 안 보인" 렌더링 문제였음:
+       (1) 기존 지형 팔레트가 이미 어두운 슬레이트/카키 톤이었고,
+       (2) 그 위에 접지음영(AO)이 0.22까지 곱해지고,
+       (3) 거기에 그림자(shadow map)까지 겹치면서 거의 완전한 검은색으로
+           뭉개져 배경(하늘)과 구분이 안 됐음 — 그래서 건물/교각 밑동이
+           마치 허공에 뜬 것처럼 보인 것.
+     - 지형 팔레트를 흙색 계열(연한 갈색, #5a4632~#9c8760)로 교체
+     - AO 최소 명도를 0.22 → 0.55로 올려 그림자와 겹쳐도 새까맣게 안 되게 함
+     - 고가도로: 시작/끝 쪽 몇 개 점에서 여유고를 지면 높이까지 서서히
+       낮추는 램프(taper) 추가 → 일반 도로와 자연스럽게 이어져 보임
+     - 고가도로 교각을 18m 간격으로 촘촘히 추가(기존엔 OSM 점에만 세워서
+       간격이 넓었음), 램프 구간처럼 지면에 거의 닿는 곳은 교각 생략
+     ※ 참고로 건물/고가도로 자체에 "그 위치의 실측 지반 표고" 데이터가
+       있는 게 아니라 v12에서 답한 대로 SRTM 추정치(sampleHeight)를 쓰고
+       있음 — 이번 v13에서 확인했듯 그동안의 "떠 보임"은 그 추정 오차
+       때문이 아니라 렌더링 명도 문제였으므로, 추가 표고 데이터가 없어도
+       해결됨.
+ v14 v13 이후에도 특정 구역(용인 사이트 로컬 NED 대략 N39~250,E88~119 부근,
+     아파트 단지 여러 동)에서 같은 신고가 재차 발생 (현재 버전)
+     ※ 원인: v13에서 AO_MIN_SHADE는 올렸지만, "밤(night)" 프리셋은 ambient
+       자체가 어둡고(intensity 0.40) 그 위에 그림자까지 겹치면 지형이 다시
+       거의 완전한 검은색이 되어 건물 실루엣과 구분이 안 됐음 — setTimeOfDay
+       ('night')로 재현 확인. 즉 라이팅 프리셋에 따라 같은 버그가 다른
+       조건으로 재발한 것.
+     - 지형 재질에 emissive(#14100a, 아주 어두운 흙색) 추가 — 조명/그림자/
+       시간대와 무관하게 지형이 이 밝기 밑으로는 절대 안 내려가는 하한선
+       역할. 밤/새벽/일몰 등 어떤 프리셋에서도 지형이 검은 실루엣과 뭉개져
+       안 보이는 일이 없도록 하는 안전장치.
+     - dawn/night 프리셋에서도 직접 재현·확인 후 반영.
+ v15 건물 하부의 검은 받침/접지 그림자 제거
+     - 건물 외곽보다 1.8m 넓게 만들던 plinth 메시를 제거. 이 메시 자체가
+       건물 바닥 밖에 검은 띠와 인위적인 단차를 보이게 한 원인이었음.
+     - 건물 본체의 렌더링용 바닥을 footprint 및 가장자리 샘플 중 최저 지형보다
+       0.15m 낮게 배치. 벽체는 지형 속으로 아주 조금만 들어가므로, 별도 받침 없이
+       틈은 가리고 지면 위로 확장된 형상은 만들지 않음. 충돌용 baseY/roof는 유지.
+     - 건물 주변 AO와 건물의 shadow-map 투영을 비활성화하여, 지면에 건물 외곽을
+       따라 생기던 어두운 띠를 제거.
+
+ ────────────────────────────────────────────────────────────
+ v1 (본 파일) — 2026-09-02부로 고정(freeze). 키보드로 직접 조종하는
+ 독립형(standalone) 시뮬레이터 버전은 여기서 더 이상 기능을 추가하지
+ 않는다. PX4 실물(HITL) 연동이 필요한 이후 작업은 전부
+ quadrotor_hud_v2.html + bridge/(Python, pymavlink 브릿지)에서 계속함.
+ v1은 그대로 두되, v2에서 재사용하는 WorldModel/Renderer/TargetDrone/HUD
+ 모듈에 변경이 생기면 필요 시 이 파일에도 반영 여부를 판단할 것.
+
+ 유지보수 메모
+ --------------------------------------------------------------
+ - 여러 세션이 동시에 이 파일을 편집할 수 있으므로, Artifact 재게시
+   전에는 항상 최신본을 다시 읽고 diff 확인 후 병합할 것.
+ - 대기 모델: 명시적 언급 없으면 항상 ISA 표준대기 기준.
+ - 지형/건물/도로 데이터는 런타임에 외부 API를 호출하지 않고
+   TERRAIN_DATA로 전부 사전 임베드되어 있음 (Artifact CSP 제약).
+====================================================================
+-->
+<title>Quadrotor HUD</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+  :root{
+    --bg:#0a0e14;
+    --bg-2:#0d131a;
+    --grid-dot:#243542;
+    --grid-dot-far:#182430;
+    --ring:#33475475;
+    --ring-major:#5c7684;
+    --hud:#5eead4;
+    --hud-dim:#2e6f68;
+    --hud-soft:rgba(94,234,212,0.14);
+    --warn:#f2b84b;
+    --text:#d7e4e8;
+    --text-dim:#71858e;
+    --panel-bg:rgba(11,16,21,0.66);
+    --panel-border:rgba(94,234,212,0.22);
+    --keycap-bg:rgba(255,255,255,0.045);
+    --keycap-border:rgba(215,228,232,0.24);
+  }
+  *{box-sizing:border-box;}
+  html,body{
+    margin:0; padding:0; width:100%; height:100%; overflow:hidden;
+    background:var(--bg); color:var(--text);
+    font-family:'Barlow Condensed',sans-serif;
+  }
+  .sr-only{
+    position:absolute; width:1px; height:1px; padding:0; margin:-1px;
+    overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0;
+  }
+  #world{ position:absolute; inset:0; display:block; width:100%; height:100%; }
+  .vignette{
+    position:absolute; inset:0; pointer-events:none;
+    background:radial-gradient(ellipse at center, transparent 45%, rgba(6,8,9,0.55) 100%);
+  }
+  .hud{ position:absolute; inset:0; pointer-events:none; padding:26px 30px; }
+  .panel{
+    background:var(--panel-bg);
+    border:1px solid var(--panel-border);
+    backdrop-filter:blur(2px);
+  }
+  .mono{ font-family:'JetBrains Mono',monospace; font-variant-numeric:tabular-nums; }
+  .label{
+    font-size:12px; letter-spacing:0.14em; text-transform:uppercase;
+    color:var(--text-dim); font-weight:600;
+  }
+  .icd-tag{
+    font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.02em;
+    color:var(--hud-dim); margin-top:3px; white-space:nowrap;
+  }
+  .icd-tag b{ color:var(--hud); font-weight:500; }
+  .top-left{ position:absolute; top:26px; left:30px; }
+  .title-block .name{
+    font-size:20px; font-weight:700; letter-spacing:0.06em; color:var(--text);
+    text-transform:uppercase;
+  }
+  .title-block .mode{
+    margin-top:4px; font-size:13px; color:var(--hud); letter-spacing:0.08em;
+    display:inline-flex; align-items:center; gap:8px; padding:3px 10px 4px;
+    border:1px solid var(--panel-border); background:var(--hud-soft);
+    text-transform:uppercase;
+  }
+  .dot{ width:6px; height:6px; border-radius:50%; background:var(--hud); flex:none; }
+
+  .bottom-left-stack{
+    position:absolute; bottom:26px; left:30px;
+    display:flex; flex-direction:column; align-items:flex-start; gap:10px;
+  }
+  .attitude-cluster{ display:flex; gap:14px; flex-wrap:wrap; max-width:70vw; }
+  .attitude-cluster .cell{ padding:8px 14px; min-width:86px; }
+  .attitude-cluster .value{ font-size:20px; color:var(--text); margin-top:2px; }
+  .attitude-cluster .value.warn{ color:var(--warn); }
+  .attitude-cluster .value .unit{ font-size:12px; color:var(--text-dim); margin-left:3px; }
+
+  .pos-readout{
+    padding:8px 14px; color:var(--text-dim); font-size:13px;
+  }
+  .pos-readout .label{ margin-bottom:2px; }
+  .pos-readout .value{ color:var(--text); }
+
+  .legend{
+    position:absolute; bottom:26px; left:50%; transform:translateX(-50%);
+    display:flex; align-items:center; gap:14px; padding:9px 16px;
+  }
+  .legend .group{ display:flex; align-items:center; gap:6px; }
+  .legend .group-label{ font-size:11px; color:var(--text-dim); letter-spacing:0.1em; text-transform:uppercase; margin-right:2px; }
+  .key{
+    display:inline-flex; align-items:center; justify-content:center;
+    min-width:22px; height:20px; padding:0 5px;
+    background:var(--keycap-bg); border:1px solid var(--keycap-border);
+    font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text);
+    border-radius:3px;
+  }
+  .legend .sep{ width:1px; height:18px; background:var(--panel-border); }
+
+  .rc-link{ display:flex; align-items:center; gap:7px; margin-top:6px; }
+  .rc-link .rc-dot{
+    width:6px; height:6px; border-radius:50%; background:var(--hud-dim);
+    flex:none; transition:background-color 60ms linear, box-shadow 60ms linear;
+  }
+  .rc-link .rc-dot.on{ background:var(--hud); box-shadow:0 0 6px 1px var(--hud-soft); }
+  .rc-link .rc-text{ font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--text-dim); letter-spacing:0.02em; }
+  .rc-link .rc-text b{ color:var(--hud); font-weight:500; }
+
+  .reset-hint{
+    position:absolute; bottom:26px; right:30px; padding:8px 12px;
+    font-size:12px; color:var(--text-dim); letter-spacing:0.06em;
+  }
+  .reset-hint .key{ margin-right:6px; }
+
+  .time-selector{
+    position:absolute; bottom:74px; left:50%; transform:translateX(-50%);
+    display:flex; align-items:center; gap:6px; padding:7px 12px;
+    pointer-events:auto;
+  }
+  .vehicle-selector{
+    position:absolute; top:26px; right:30px;
+    display:flex; align-items:center; gap:6px; padding:7px 12px;
+    pointer-events:auto;
+  }
+  .time-selector .group-label, .vehicle-selector .group-label{
+    font-size:11px; color:var(--text-dim); letter-spacing:0.1em; text-transform:uppercase; margin-right:4px;
+  }
+  .time-btn{
+    font-family:'Barlow Condensed', sans-serif; font-size:12px; font-weight:600;
+    letter-spacing:0.04em; color:var(--text-dim); background:transparent;
+    border:1px solid var(--panel-border); border-radius:3px; padding:5px 12px;
+    cursor:pointer;
+  }
+  .time-btn:hover{ color:var(--text); border-color:var(--keycap-border); }
+  .time-btn.active{ color:var(--hud); border-color:var(--hud); background:var(--hud-soft); }
+  .time-btn:focus-visible{ outline:1px solid var(--hud); outline-offset:1px; }
+
+  .target-panel{
+    padding:10px 14px; display:flex; flex-direction:column; gap:7px;
+    pointer-events:auto; max-width:70vw;
+  }
+  .target-panel-row{ display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .target-panel .icd-tag{ margin-top:0; }
+
+  @media (max-width:820px){
+    .attitude-cluster{ max-width:88vw; }
+    .legend{ flex-wrap:wrap; max-width:88vw; justify-content:center; }
+    .pos-readout{ display:none; }
+    .target-panel{ max-width:88vw; }
+    .time-selector{ flex-wrap:wrap; max-width:88vw; justify-content:center; bottom:96px; }
+    .vehicle-selector{ top:auto; bottom:130px; right:auto; left:50%; transform:translateX(-50%); flex-wrap:wrap; max-width:88vw; justify-content:center; }
+  }
+</style>
+
+<h2 class="sr-only">키보드로 조종하는 3D 쿼드콥터 비행 시뮬레이터. 방향키로 피치와 롤, A와 D로 요, W와 S로 스로틀을 조작하면 3D 지면 격자와 나침반 링 위를 기체가 이동하며, 카메라가 기체의 방위각을 따라 회전하는 체이스 뷰로 렌더링됩니다.</h2>
+
+<canvas id="world" aria-hidden="true"></canvas>
+<div class="vignette" aria-hidden="true"></div>
+
+<div class="hud">
+  <div class="top-left title-block">
+    <div class="name">Quadrotor HUD</div>
+    <div class="mode"><span class="dot"></span>MC MODE &middot; ICD-PXTR-HILS-001 CH&#9312;/&#9314;</div>
+  </div>
+
+  <div class="vehicle-selector panel">
+    <span class="group-label">Vehicle</span>
+    <button type="button" class="time-btn vehicle-btn active" data-vehicle-index="0">쿼드콥터</button>
+    <button type="button" class="time-btn vehicle-btn" data-vehicle-index="1">틸트로터</button>
+  </div>
+
+  <div class="bottom-left-stack">
+    <div class="attitude-cluster">
+      <div class="panel cell">
+        <div class="label">HDG</div>
+        <div class="value mono"><span id="hdg-val">000</span>&deg;</div>
+        <div class="icd-tag"><b>C-04</b> VFR_HUD &middot; 15 Hz</div>
+      </div>
+      <div class="panel cell">
+        <div class="label">Roll</div>
+        <div class="value mono" id="roll-val">0&deg;</div>
+      </div>
+      <div class="panel cell">
+        <div class="label">Pitch</div>
+        <div class="value mono" id="pitch-val">0&deg;</div>
+        <div class="icd-tag"><b>C-02</b> ATTITUDE_QUAT &middot; 60 Hz</div>
+      </div>
+      <div class="panel cell">
+        <div class="label">Tilt</div>
+        <div class="value mono" id="tilt-val">0&deg;</div>
+        <div class="icd-tag"><b>A-09/C-06</b> HIL_TILT_STATE &middot; 20 Hz</div>
+      </div>
+      <div class="panel cell">
+        <div class="label">Alt</div>
+        <div class="value mono"><span id="alt-val">0.0</span><span class="unit">m</span></div>
+        <div class="icd-tag"><b>C-01</b> GLOBAL_POSITION_INT &middot; 20 Hz</div>
+      </div>
+      <div class="panel cell">
+        <div class="label">Speed</div>
+        <div class="value mono"><span id="spd-val">0.0</span><span class="unit">m/s</span></div>
+        <div class="icd-tag"><b>C-03</b> VFR_HUD &middot; 15 Hz</div>
+      </div>
+    </div>
+
+    <div class="pos-readout panel">
+      <div class="label">Local NED (m)</div>
+      <div class="value mono">N <span id="pos-n">0.0</span> &nbsp; E <span id="pos-e">0.0</span></div>
+      <div class="icd-tag">LOCAL_POSITION_NED</div>
+    </div>
+
+    <!-- 타겟 드론 패널 — 형상/조종모드 선택 + 재배치. TargetDrone 모듈(스크립트 하단)만 건드리면 됨. -->
+    <div class="target-panel panel">
+      <div class="target-panel-row">
+        <span class="group-label">Target</span>
+        <button type="button" class="time-btn target-shape-btn active" data-target-shape="quad">쿼드콥터</button>
+        <button type="button" class="time-btn target-shape-btn" data-target-shape="fixedwing">고정익</button>
+      </div>
+      <div class="target-panel-row">
+        <button type="button" class="time-btn target-mode-btn active" data-target-mode="auto">자동비행</button>
+        <button type="button" class="time-btn target-mode-btn" data-target-mode="manual">수동(IJKL/UO)</button>
+        <button type="button" class="time-btn" id="target-respawn-btn">재배치</button>
+      </div>
+      <div class="icd-tag" id="target-status">SPD -- m/s &middot; ALT -- m</div>
+    </div>
+  </div>
+
+  <div class="time-selector panel">
+    <span class="group-label">Time</span>
+    <button type="button" class="time-btn" data-time="dawn">새벽</button>
+    <button type="button" class="time-btn" data-time="morning">아침</button>
+    <button type="button" class="time-btn active" data-time="noon">낮</button>
+    <button type="button" class="time-btn" data-time="sunset">일몰</button>
+    <button type="button" class="time-btn" data-time="night">밤</button>
+  </div>
+
+  <div class="legend panel">
+    <div class="group"><span class="group-label">Pitch/Roll</span><span class="key">&uarr;</span><span class="key">&darr;</span><span class="key">&larr;</span><span class="key">&rarr;</span></div>
+    <div class="sep"></div>
+    <div class="group"><span class="group-label">Yaw</span><span class="key">A</span><span class="key">D</span></div>
+    <div class="sep"></div>
+    <div class="group"><span class="group-label">Throttle</span><span class="key">W</span><span class="key">S</span></div>
+    <div class="sep"></div>
+    <div class="group"><span class="group-label">Tilt</span><span class="key">Q</span><span class="key">E</span></div>
+    <div class="sep"></div>
+    <div class="rc-link" title="RC_CHANNELS 검증 채널 — ICD D-01, 10 Hz 전송 주기로 샘플-홀드">
+      <span class="rc-dot" id="rc-dot"></span>
+      <span class="rc-text"><b style="color:var(--hud)">D-01</b> RC_CHANNELS &middot; 10 Hz</span>
+    </div>
+  </div>
+
+  <div class="reset-hint panel"><span class="key">R</span>Reset</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+var TERRAIN_DATA = {"meta":{"lat":37.27908611111111,"lon":127.10344722222221,"originElevM":68.0,"gridN":25,"halfSizeM":250.0,"buildingSource":"AL_D198/D199 (용인시 기흥구 건축물대장, 실측 높이)"},"heights":[-4.0,-3.0,-2.0,-3.0,-4.0,-5.0,-6.0,-5.0,-3.0,-3.0,-3.0,-3.0,-3.0,-2.0,-3.0,-5.0,-6.0,-7.0,-7.0,-6.0,-5.0,-5.0,-4.0,-2.0,0.0,-2.0,-1.0,-1.0,-2.0,-3.0,-3.0,-4.0,-3.0,-1.0,-1.0,-2.0,-3.0,-3.0,-3.0,-4.0,-6.0,-7.0,-7.0,-7.0,-6.0,-5.0,-5.0,-3.0,-1.0,1.0,0.0,1.0,1.0,0.0,-1.0,-1.0,-1.0,-1.0,0.0,0.0,-1.0,-3.0,-3.0,-3.0,-4.0,-6.0,-8.0,-8.0,-7.0,-7.0,-6.0,-4.0,-1.0,1.0,2.0,1.0,1.0,2.0,2.0,3.0,3.0,3.0,2.0,2.0,1.0,-1.0,-3.0,-4.0,-5.0,-5.0,-7.0,-9.0,-9.0,-8.0,-7.0,-6.0,-4.0,-1.0,1.0,2.0,1.0,1.0,2.0,4.0,6.0,7.0,8.0,7.0,6.0,5.0,1.0,-3.0,-5.0,-6.0,-6.0,-8.0,-10.0,-10.0,-9.0,-7.0,-5.0,-4.0,-1.0,1.0,3.0,0.0,1.0,2.0,5.0,9.0,12.0,14.0,13.0,13.0,10.0,4.0,-1.0,-5.0,-7.0,-6.0,-9.0,-11.0,-12.0,-11.0,-8.0,-5.0,-3.0,-2.0,0.0,3.0,2.0,3.0,5.0,8.0,13.0,16.0,18.0,19.0,20.0,16.0,9.0,2.0,-3.0,-5.0,-6.0,-9.0,-13.0,-15.0,-14.0,-10.0,-6.0,-3.0,-1.0,1.0,3.0,4.0,6.0,10.0,13.0,17.0,19.0,21.0,23.0,24.0,19.0,12.0,5.0,-1.0,-4.0,-6.0,-9.0,-14.0,-16.0,-15.0,-11.0,-7.0,-3.0,-1.0,1.0,3.0,6.0,11.0,16.0,20.0,22.0,23.0,24.0,25.0,25.0,19.0,14.0,7.0,1.0,-2.0,-6.0,-10.0,-13.0,-15.0,-13.0,-10.0,-6.0,-4.0,-1.0,0.0,4.0,8.0,14.0,20.0,24.0,26.0,27.0,26.0,26.0,26.0,20.0,16.0,9.0,2.0,-4.0,-7.0,-11.0,-12.0,-12.0,-10.0,-8.0,-6.0,-4.0,-2.0,0.0,3.0,12.0,17.0,23.0,27.0,30.0,30.0,28.0,27.0,26.0,21.0,17.0,10.0,2.0,-5.0,-8.0,-10.0,-10.0,-10.0,-8.0,-7.0,-5.0,-4.0,-2.0,-1.0,1.0,15.0,21.0,26.0,30.0,32.0,32.0,30.0,27.0,25.0,21.0,17.0,10.0,2.0,-4.0,-8.0,-8.0,-9.0,-8.0,-8.0,-7.0,-5.0,-4.0,-2.0,-2.0,-1.0,17.0,22.0,26.0,30.0,32.0,31.0,28.0,24.0,21.0,18.0,12.0,6.0,0.0,-4.0,-6.0,-7.0,-7.0,-8.0,-8.0,-6.0,-4.0,-3.0,-2.0,-2.0,-1.0,18.0,22.0,25.0,28.0,30.0,28.0,25.0,21.0,17.0,13.0,8.0,3.0,-1.0,-3.0,-4.0,-5.0,-6.0,-8.0,-7.0,-6.0,-3.0,-2.0,-2.0,-1.0,0.0,19.0,21.0,22.0,25.0,26.0,24.0,20.0,16.0,12.0,7.0,3.0,0.0,-2.0,-3.0,-3.0,-3.0,-4.0,-6.0,-6.0,-5.0,-3.0,-2.0,-2.0,-1.0,2.0,20.0,20.0,21.0,23.0,23.0,20.0,17.0,13.0,10.0,6.0,2.0,-1.0,-3.0,-4.0,-3.0,-2.0,-3.0,-4.0,-5.0,-4.0,-3.0,-3.0,-2.0,0.0,2.0,22.0,21.0,21.0,22.0,21.0,19.0,15.0,12.0,10.0,7.0,3.0,-1.0,-4.0,-4.0,-3.0,-1.0,-1.0,-2.0,-3.0,-4.0,-3.0,-3.0,-1.0,1.0,3.0,23.0,22.0,21.0,21.0,21.0,18.0,15.0,13.0,10.0,8.0,4.0,0.0,-4.0,-5.0,-3.0,0.0,1.0,0.0,-2.0,-3.0,-4.0,-2.0,0.0,2.0,4.0,22.0,19.0,17.0,17.0,17.0,17.0,15.0,14.0,12.0,9.0,5.0,0.0,-3.0,-5.0,-3.0,0.0,1.0,0.0,-2.0,-4.0,-4.0,-3.0,0.0,2.0,4.0,20.0,16.0,13.0,14.0,14.0,13.0,13.0,11.0,11.0,8.0,4.0,0.0,-3.0,-4.0,-2.0,0.0,1.0,0.0,-2.0,-5.0,-5.0,-3.0,-1.0,2.0,3.0,17.0,13.0,11.0,11.0,10.0,9.0,8.0,8.0,8.0,7.0,3.0,0.0,-2.0,-3.0,-1.0,0.0,1.0,0.0,-2.0,-5.0,-5.0,-4.0,-1.0,1.0,3.0,14.0,10.0,9.0,9.0,8.0,5.0,4.0,4.0,4.0,3.0,1.0,-1.0,-2.0,-3.0,-2.0,-1.0,-1.0,-1.0,-3.0,-4.0,-4.0,-3.0,-1.0,1.0,3.0,13.0,9.0,7.0,7.0,5.0,3.0,2.0,2.0,3.0,1.0,0.0,-2.0,-3.0,-4.0,-3.0,-2.0,-1.0,-2.0,-3.0,-4.0,-3.0,-2.0,0.0,2.0,4.0,12.0,9.0,6.0,5.0,4.0,3.0,2.0,1.0,2.0,0.0,-1.0,-3.0,-4.0,-6.0,-4.0,-2.0,-2.0,-2.0,-2.0,-3.0,-3.0,-2.0,1.0,3.0,5.0,14.0,10.0,6.0,5.0,3.0,3.0,2.0,2.0,1.0,0.0,-1.0,-3.0,-5.0,-6.0,-5.0,-3.0,-2.0,-2.0,-2.0,-2.0,-3.0,-1.0,1.0,3.0,5.0],"roads":[{"tier":"major","pts":[[13.9,250.0],[17.1,-132.0],[17.0,-250.0]]},{"tier":"major","pts":[[209.1,63.8],[212.3,182.5],[212.2,186.2],[211.6,250.0]]},{"tier":"major","pts":[[73.9,-209.4],[81.1,-169.0],[95.9,-128.7],[149.9,-37.4],[180.9,20.7],[192.6,40.8],[203.8,70.4],[208.1,104.8],[205.6,250.0]]},{"tier":"major","pts":[[70.6,-250.0],[73.9,-209.4]]},{"tier":"major","pts":[[-92.1,-213.4],[-42.4,-250.0]]},{"tier":"minor","pts":[[-114.7,250.0],[-114.5,248.9],[-106.4,234.2],[-102.6,216.1],[-112.2,207.4],[-122.2,194.6],[-124.0,205.7],[-164.8,249.4],[-164.9,250.0]]},{"tier":"minor","pts":[[-51.8,186.4],[-54.9,206.7],[-42.7,207.0]]},{"tier":"minor","pts":[[-161.5,82.6],[-152.5,180.5],[-122.2,194.6],[-103.5,197.6],[-70.7,194.3],[-51.8,186.4],[-8.8,168.5]]},{"tier":"minor","pts":[[-122.2,194.6],[-108.3,162.9],[-107.8,114.0],[-97.3,106.4],[-76.1,116.2],[-48.1,123.8],[-47.9,167.6],[-70.7,194.3]]},{"tier":"major","pts":[[37.6,-250.0],[38.3,-132.0],[36.6,250.0]]},{"tier":"major","pts":[[250.0,63.8],[209.1,63.8]]},{"tier":"major","pts":[[250.0,188.3],[249.1,187.8],[212.2,186.2]]},{"tier":"major","pts":[[250.0,-145.5],[246.5,-145.4],[233.5,-145.0],[203.4,-144.7]]},{"tier":"major","pts":[[250.0,-12.8],[233.0,-12.4],[207.8,-10.9]]},{"tier":"major","pts":[[-42.7,207.0],[-28.2,207.3]]},{"tier":"minor","pts":[[-28.2,207.3],[-28.8,248.8],[-32.5,250.0]]},{"tier":"major","pts":[[143.3,250.0],[142.7,126.5],[151.3,115.7],[152.7,66.5],[153.5,27.1],[157.0,18.7]]},{"tier":"major","pts":[[189.5,250.0],[189.4,243.8],[190.7,94.0]]},{"tier":"major","pts":[[-9.6,250.0],[-8.8,168.5],[-4.2,-250.0]]},{"tier":"major","pts":[[152.7,66.5],[156.7,66.4]]},{"tier":"major","pts":[[190.7,94.0],[196.5,64.4]]},{"tier":"major","pts":[[73.3,-250.0],[77.3,-243.1],[80.6,-209.9],[87.3,-170.9],[102.0,-130.7],[179.6,1.7]]},{"tier":"major","pts":[[247.3,250.0],[247.1,238.6],[250.0,238.6]]},{"tier":"minor","pts":[[250.0,152.1],[243.8,152.2]]},{"tier":"minor","pts":[[244.8,123.0],[250.0,123.0]]},{"tier":"minor","pts":[[243.5,94.2],[250.0,94.2]]},{"tier":"minor","pts":[[233.0,-12.4],[232.8,-43.9],[235.9,-46.7],[247.9,-57.6],[250.0,-57.6]]},{"tier":"minor","pts":[[250.0,-109.8],[247.0,-112.1],[246.7,-133.1],[246.5,-145.4]]},{"tier":"minor","pts":[[223.5,-46.9],[235.9,-46.7]]},{"tier":"minor","pts":[[222.8,-132.2],[246.7,-133.1],[250.0,-133.2]]},{"tier":"minor","pts":[[157.0,18.7],[152.8,9.3],[147.3,4.3],[62.8,3.8],[49.7,15.4],[50.9,62.0],[48.5,160.6],[48.4,250.0]]},{"tier":"minor","pts":[[49.7,15.4],[50.3,-155.6],[51.1,-192.2],[52.5,-250.0]]},{"tier":"major","pts":[[196.5,64.4],[197.5,35.3]]},{"tier":"minor","pts":[[203.4,-144.7],[163.0,-141.9],[162.0,-144.0],[134.9,-201.4],[134.7,-239.9],[134.7,-250.0]]},{"tier":"minor","pts":[[162.0,-144.0],[146.9,-136.6]]},{"tier":"minor","pts":[[100.6,-250.0],[101.4,-226.5],[146.9,-136.6],[147.8,-134.8],[160.6,-110.0],[174.2,-61.7]]},{"tier":"minor","pts":[[202.1,-240.9],[134.7,-239.9]]},{"tier":"major","pts":[[-250.0,-197.0],[-218.1,-236.0],[-206.6,-250.0]]},{"tier":"major","pts":[[190.7,94.0],[187.6,64.6]]},{"tier":"minor","pts":[[-218.1,-236.0],[-235.2,-250.0]]},{"tier":"major","pts":[[156.7,66.4],[171.0,66.1]]},{"tier":"major","pts":[[171.0,66.1],[180.6,65.3],[187.6,64.6]]},{"tier":"major","pts":[[203.4,-144.7],[206.9,-137.9],[207.8,-10.9],[209.8,37.1],[209.1,63.8]]},{"tier":"major","pts":[[179.6,1.7],[186.2,5.4],[190.5,5.6],[194.1,3.3],[196.3,-2.1],[198.9,-11.7]]},{"tier":"major","pts":[[179.6,1.7],[178.5,6.4],[177.0,9.8],[174.2,11.7],[171.2,12.1],[168.7,11.1],[164.0,8.4]]},{"tier":"major","pts":[[197.5,35.3],[209.1,63.8]]},{"tier":"major","pts":[[202.0,-250.0],[202.1,-240.9],[203.4,-144.7]]},{"tier":"major","pts":[[197.5,35.3],[198.9,-11.7],[199.1,-137.9],[203.4,-144.7]]},{"tier":"major","pts":[[209.1,63.8],[196.5,64.4]]},{"tier":"major","pts":[[187.6,64.6],[183.0,46.6],[174.6,29.8],[166.3,13.1]]},{"tier":"major","pts":[[196.5,64.4],[187.6,64.6]]},{"tier":"major","pts":[[164.0,8.4],[158.3,-3.7],[93.5,-117.6],[73.1,-169.5],[67.3,-199.2],[65.7,-207.5],[63.8,-219.5],[62.5,-250.0]]},{"tier":"major","pts":[[179.6,1.7],[181.8,5.4],[197.5,35.3]]},{"tier":"major","pts":[[166.3,13.1],[164.0,8.4]]},{"tier":"major","pts":[[157.0,18.7],[161.6,15.9],[166.3,13.1]]},{"tier":"minor","pts":[[67.3,-199.2],[61.7,-197.5],[58.4,-196.5],[51.1,-192.2]]},{"tier":"minor","pts":[[184.3,250.0],[181.7,95.4],[180.6,65.3],[180.4,60.8],[162.0,16.7],[161.6,15.9],[155.4,2.2],[112.7,-66.3],[106.7,-79.4],[105.1,-84.5],[87.6,-109.3],[77.0,-131.2],[66.7,-172.7],[61.7,-197.5],[60.4,-207.4],[58.6,-250.0]]}],"buildings":[{"pts":[[-237.1,77.4],[-229.4,98.9],[-197.2,87.4],[-204.9,65.9],[-219.7,71.1],[-219.9,70.6],[-222.6,71.5],[-222.4,72.1],[-237.1,77.4]],"h":12.7},{"pts":[[156.4,-202.2],[156.1,-208.7],[138.8,-208.4],[138.7,-204.3],[139.9,-204.4],[139.8,-201.9],[156.4,-202.2]],"h":7.4},{"pts":[[-30.1,-218.9],[-22.0,-218.6],[-21.8,-223.2],[-30.0,-223.3],[-30.1,-218.9]],"h":3.2},{"pts":[[-40.3,-223.6],[-30.9,-223.4],[-30.5,-238.7],[-47.4,-239.1],[-47.5,-234.0],[-40.3,-223.6]],"h":3.2},{"pts":[[170.9,-215.1],[170.4,-223.1],[156.4,-222.5],[156.9,-214.3],[170.9,-215.1]],"h":10.0},{"pts":[[97.4,118.6],[108.2,119.5],[109.4,99.7],[98.8,98.6],[97.4,118.6]],"h":10.2},{"pts":[[98.9,96.6],[109.8,96.8],[110.0,78.7],[99.6,78.1],[98.9,96.6]],"h":10.2},{"pts":[[-193.6,-236.7],[-190.1,-240.8],[-189.1,-240.1],[-186.6,-243.1],[-194.3,-250.1],[-202.5,-240.2],[-198.2,-236.4],[-193.6,-236.7]],"h":12.0},{"pts":[[224.2,38.1],[224.3,52.5],[227.6,55.6],[250.6,54.6],[250.6,46.3],[233.5,46.5],[233.6,38.0],[224.2,38.1]],"h":17.4},{"pts":[[170.2,-255.3],[161.8,-255.4],[161.7,-250.1],[162.4,-250.1],[162.6,-244.4],[163.4,-244.4],[163.4,-243.7],[170.4,-244.0],[170.2,-255.3]],"h":6.4},{"pts":[[-69.4,-196.2],[-67.0,-197.2],[-65.7,-198.9],[-74.6,-211.2],[-80.4,-207.3],[-77.3,-202.7],[-78.0,-200.3],[-75.8,-199.8],[-74.1,-197.4],[-71.0,-196.0],[-69.4,-196.2]],"h":9.6},{"pts":[[190.4,-136.1],[190.8,-121.3],[198.1,-121.2],[198.1,-136.3],[190.4,-136.1]],"h":10.5},{"pts":[[102.2,54.8],[113.6,55.5],[114.6,34.9],[103.4,34.2],[102.2,54.8]],"h":10.2},{"pts":[[166.6,-210.6],[157.0,-210.1],[157.6,-201.4],[168.5,-202.1],[168.4,-203.8],[169.2,-203.9],[169.0,-206.6],[168.3,-206.6],[168.1,-208.9],[166.9,-208.9],[166.6,-210.6]],"h":6.4},{"pts":[[-33.4,-205.1],[-33.4,-216.5],[-33.4,-217.1],[-33.1,-217.5],[-32.8,-218.3],[-32.8,-219.0],[-33.0,-219.6],[-33.7,-220.0],[-39.5,-220.1],[-39.6,-218.7],[-41.7,-218.7],[-41.6,-216.9],[-44.2,-217.3],[-44.3,-214.9],[-47.7,-215.1],[-47.7,-210.0],[-42.8,-210.1],[-42.9,-206.6],[-39.4,-206.7],[-39.4,-205.0],[-33.4,-205.1]],"h":16.0},{"pts":[[137.9,-5.8],[137.2,-15.6],[111.6,-14.8],[112.2,-4.6],[137.9,-5.8]],"h":4.5},{"pts":[[197.0,-181.0],[189.0,-180.8],[189.2,-170.2],[189.4,-170.2],[189.4,-167.3],[197.2,-167.5],[197.0,-181.0]],"h":9.6},{"pts":[[156.3,-225.9],[170.2,-226.5],[170.2,-233.1],[168.2,-235.4],[156.0,-235.1],[156.3,-225.9]],"h":9.3},{"pts":[[138.5,-211.4],[155.8,-212.0],[155.0,-222.8],[142.7,-222.6],[142.8,-220.3],[138.2,-220.1],[138.5,-211.4]],"h":9.9},{"pts":[[104.0,33.1],[115.4,33.6],[116.3,12.4],[105.5,11.8],[104.0,33.1]],"h":9.8},{"pts":[[173.8,-161.3],[160.1,-160.5],[160.3,-155.6],[160.7,-155.6],[160.8,-154.0],[164.2,-154.2],[164.3,-153.7],[174.1,-154.5],[173.8,-161.3]],"h":6.4},{"pts":[[-115.2,-181.5],[-116.2,-202.6],[-114.7,-202.8],[-114.6,-209.1],[-110.6,-209.2],[-110.8,-214.6],[-121.7,-214.1],[-121.6,-209.7],[-129.5,-209.4],[-128.9,-186.3],[-131.4,-185.5],[-130.6,-180.5],[-115.2,-181.5]],"h":21.2},{"pts":[[-27.6,98.5],[-49.2,98.0],[-64.7,97.9],[-65.0,108.2],[-49.2,108.9],[-27.5,109.2],[-27.6,98.5]],"h":11.9},{"pts":[[191.1,-162.8],[191.7,-146.2],[197.7,-146.5],[197.5,-163.0],[191.1,-162.8]],"h":17.3},{"pts":[[153.8,-57.5],[158.2,-58.8],[158.7,-56.8],[161.9,-57.8],[157.9,-72.4],[150.2,-70.3],[153.8,-57.5]],"h":4.4},{"pts":[[-38.9,-170.7],[-41.8,-172.5],[-42.4,-171.7],[-42.1,-171.5],[-43.7,-169.0],[-41.2,-167.5],[-38.9,-170.7]],"h":3.2},{"pts":[[-73.8,-177.6],[-74.1,-183.9],[-74.1,-185.3],[-84.8,-185.0],[-84.6,-177.4],[-73.8,-177.6]],"h":3.2},{"pts":[[186.3,-188.8],[176.3,-187.8],[177.1,-178.4],[187.1,-179.3],[186.3,-188.8]],"h":11.2},{"pts":[[188.5,-150.1],[187.8,-156.6],[182.2,-156.3],[182.1,-157.1],[178.5,-156.8],[179.1,-149.5],[188.5,-150.1]],"h":3.2},{"pts":[[150.1,-175.9],[161.0,-176.4],[160.6,-185.6],[156.2,-185.5],[156.2,-184.3],[152.7,-184.1],[152.7,-181.9],[149.8,-181.6],[150.1,-175.9]],"h":6.4},{"pts":[[171.9,-169.6],[168.0,-169.5],[168.1,-168.5],[162.6,-168.2],[162.9,-161.4],[172.6,-162.0],[171.9,-169.6]],"h":3.2},{"pts":[[179.1,-255.6],[170.8,-255.5],[171.2,-243.3],[177.3,-243.4],[177.3,-245.2],[178.8,-245.3],[178.8,-250.1],[179.2,-250.1],[179.1,-255.6]],"h":6.4},{"pts":[[170.4,-196.1],[166.5,-195.7],[166.6,-194.9],[161.2,-194.4],[161.5,-187.6],[170.9,-188.3],[170.4,-196.1]],"h":3.2},{"pts":[[99.7,75.8],[110.6,76.0],[110.8,57.4],[99.7,57.4],[99.7,75.8]],"h":10.2},{"pts":[[-60.6,-201.6],[-61.6,-203.2],[-57.9,-205.7],[-58.8,-207.1],[-57.7,-207.8],[-58.9,-209.5],[-57.9,-210.1],[-60.0,-213.1],[-59.3,-213.6],[-59.8,-214.4],[-70.7,-207.9],[-64.4,-198.8],[-60.6,-201.6]],"h":9.6},{"pts":[[-48.9,-215.1],[-41.0,-220.3],[-42.9,-223.8],[-43.9,-223.1],[-45.9,-226.0],[-48.9,-224.1],[-53.8,-221.0],[-53.6,-220.4],[-57.0,-218.5],[-56.4,-217.6],[-57.3,-216.7],[-57.6,-216.3],[-57.9,-215.8],[-55.1,-211.1],[-48.9,-215.1]],"h":13.5},{"pts":[[159.8,-190.1],[159.2,-199.9],[142.5,-198.7],[142.8,-191.7],[145.0,-191.9],[145.3,-188.8],[159.8,-190.1]],"h":9.9},{"pts":[[175.6,-202.9],[189.9,-203.4],[189.4,-220.2],[175.0,-219.5],[175.6,-202.9]],"h":13.4},{"pts":[[175.2,-221.5],[194.0,-221.9],[193.8,-229.5],[181.6,-229.3],[181.5,-235.4],[175.9,-235.3],[174.9,-234.2],[175.2,-221.5]],"h":6.4},{"pts":[[248.7,35.3],[248.6,22.3],[237.7,22.3],[238.1,35.4],[248.7,35.3]],"h":8.7},{"pts":[[-65.5,254.7],[-33.6,245.7],[-33.8,205.3],[-41.9,205.3],[-41.8,238.2],[-65.6,238.3],[-65.5,254.7]],"h":11.4},{"pts":[[-76.1,209.1],[-97.4,209.3],[-97.4,249.8],[-95.0,249.5],[-95.0,257.1],[-80.0,252.1],[-79.8,252.0],[-79.8,249.3],[-77.9,249.3],[-77.9,249.9],[-76.1,249.9],[-76.1,209.1]],"h":8.5},{"pts":[[90.9,206.7],[101.1,207.4],[102.4,183.1],[91.6,182.7],[89.7,206.7],[90.9,206.7]],"h":9.9},{"pts":[[91.9,242.4],[102.1,242.4],[102.2,210.6],[92.1,210.4],[91.9,242.4]],"h":10.5},{"pts":[[80.0,141.3],[90.8,141.4],[90.7,123.1],[80.1,123.1],[80.0,141.3]],"h":11.5},{"pts":[[154.5,-82.8],[154.2,-93.2],[146.9,-93.0],[147.2,-82.5],[154.5,-82.8]],"h":5.0},{"pts":[[81.9,163.3],[94.0,163.3],[94.3,142.7],[82.2,142.7],[81.9,163.3]],"h":11.5},{"pts":[[79.1,-56.7],[88.2,-55.7],[89.5,-70.3],[82.7,-70.8],[82.6,-70.9],[82.7,-72.3],[80.2,-72.5],[79.1,-56.7]],"h":7.7},{"pts":[[122.5,-236.5],[125.1,-236.7],[125.4,-237.5],[131.5,-237.8],[131.0,-243.5],[130.0,-243.5],[129.8,-244.1],[121.4,-243.6],[122.5,-236.5]],"h":7.3},{"pts":[[224.4,-35.9],[224.9,-14.6],[231.4,-15.0],[231.1,-35.9],[224.4,-35.9]],"h":6.4},{"pts":[[239.1,12.1],[242.5,12.0],[242.5,13.4],[245.7,13.3],[245.6,11.1],[252.0,10.9],[252.0,13.2],[255.4,13.2],[255.4,9.1],[260.6,9.0],[260.6,-5.6],[224.1,-5.2],[224.9,19.8],[239.3,19.9],[239.1,12.1]],"h":17.4},{"pts":[[-101.0,-230.2],[-101.0,-243.2],[-105.9,-243.2],[-105.8,-242.3],[-108.1,-242.2],[-108.1,-243.1],[-112.9,-243.1],[-112.8,-230.0],[-101.0,-230.2]],"h":14.2},{"pts":[[-177.1,-242.1],[-175.8,-241.1],[-173.0,-244.6],[-188.1,-257.7],[-192.4,-252.4],[-178.6,-240.3],[-177.1,-242.1]],"h":12.0},{"pts":[[-90.1,-231.1],[-89.9,-244.0],[-100.6,-243.9],[-100.4,-230.9],[-90.1,-231.1]],"h":13.8}]};
+</script>
+<script>
+(function(){
+  "use strict";
+
+  // ==============================================================================
+  // 모듈 구성 (렌더러 교체 + 기체/OFP 교체를 둘 다 염두에 둔 구조)
+  //
+  //   WorldModel   — 지형/도로/건물 데이터 + 충돌 질의. 렌더러/기체 어느 쪽에도 의존하지 않는다.
+  //   Vehicle      — 기체(OFP) 모듈. 자세/추력/틸트 등 "이 기체가 어떻게 나는가"만 담당.
+  //   FlightSim    — 공통 비행 루프: RC 입력 샘플링 + Vehicle.computeDynamics() 호출 +
+  //                  위치 적분 + 지형/건물/경계 충돌 + 고도 제한. 기체가 바뀌어도 그대로 재사용.
+  //   TargetDrone  — 추격 훈련용 타겟 기체. FlightSim과 완전히 분리된 가벼운 등속도 운동
+  //                  모델(WorldModel만 공유). 자동(랜덤워크)/수동(IJKL/UO) 두 모드를 지원.
+  //   (렌더러)      — 아래 "RENDERER 계약"을 구현하는 객체. 지금은 Three.js 구현체 하나뿐.
+  //                  플레이어 기체 렌더링에 더해, 타겟 기체용 추가(선택적) 계약도 구현한다.
+  //   HUD          — DOM 텔레메트리 표시. FlightSim/TargetDrone을 읽기만 한다.
+  //
+  // ------------------------------ VEHICLE 계약 ---------------------------------
+  //   id, label                 : 식별자 / 표시용 이름
+  //   maxAlt                    : 이 기체의 최대 운용고도(m)
+  //   initialExtraState()       : 기체 고유 상태 필드의 초기값 객체 (예: 틸트로터의 {tilt:0})
+  //   computeDynamics(state,rcCmd,dt)
+  //        rcCmd = {pitch,roll,yaw,thr,tilt} (-1..1 정규화 입력)을 받아
+  //        state.pitch/roll/yawRate/heading/vN/vE/climbRate(+기체 고유 필드)를 갱신한다.
+  //        위치(north/east/alt) 적분과 지형/건물 충돌은 FlightSim이 공통 처리하므로 손대지 않는다.
+  //   geometry                  : 렌더러가 형상을 그릴 때 참고하는 선언적 설명(렌더 엔진 비의존적)
+  //                               { bodySize:{x,y,z}, hasWings, wingSpan, wingChord,
+  //                                 motors:[{x,z,tiltable}, ...] }
+  //   controlHint               : 범례에 추가로 표시할 조작법 문자열 (없으면 null)
+  //
+  // 새 기체(예: 별도 고정익)를 추가하려면 createXxxVehicle() 팩토리 함수 하나를 이 계약대로
+  // 작성하고, VEHICLES 배열에 등록하면 끝난다. FlightSim/렌더러/HUD는 손댈 필요 없다.
+  //
+  // ---------------------------- RENDERER 계약 ----------------------------------
+  //   init(canvas, world, vehicle)  : 캔버스/씬 초기화, 지형·도로·건물·초기 기체 메시 생성 (1회)
+  //   updateFromState(state)        : 매 프레임, 물리 상태(state)를 카메라/기체 위치·자세·틸트에 반영
+  //   render()                      : 한 프레임 그리기
+  //   resize()                      : 창 크기 변경 대응
+  //   setTimeOfDay(key)             : "dawn"|"morning"|"noon"|"sunset"|"night" 프리셋 적용
+  //   setVehicle(vehicle)           : 기체가 바뀔 때 기존 기체 메시를 지우고 새 형상으로 재구성
+  //
+  // ------------------------- RENDERER 추가 계약 (타겟 기체, 선택적) -------------------
+  //   setTargetGeometry(geometry)   : 타겟용 기체 메시를 (재)생성. geometry 형식은 Vehicle과 동일.
+  //   updateTargetFromState(state)  : 매 프레임, 타겟의 물리 상태(TargetDrone.state)를 위치/자세에 반영.
+  //                                   state.active=false면 메시를 숨긴다.
+  // ==============================================================================
+
+
+  // ==============================================================================
+  // MODULE: WorldModel — 지형/도로/건물 데이터 및 충돌 질의 (렌더러 독립적)
+  // ==============================================================================
+  var WorldModel = (function(TD){
+    var N = TD.meta.gridN;
+    var HALF = TD.meta.halfSizeM;
+    var SEGS = N - 1;
+    var SIZE = HALF * 2;
+    var MIN_H = Math.min.apply(null, TD.heights);
+    var MAX_H = Math.max.apply(null, TD.heights);
+    var ROAD_WIDTH = { major: 5.0, minor: 2.4 };
+    var BRIDGE_CLEARANCE = 5.5; // 실제 고가도로 교량 하부 여유고(桁下高) 근사치, m
+
+    // 실제 고가도로(overpass) 구간 표시 — Overpass 원본(HILS_ICD/sim/_terrain_raw/
+    // overpass_result.json)에서 이 도로가 "bridge":"yes","bridge:name":"신갈제1고가차도"
+    // 태그를 갖고 있음을 좌표 대조로 직접 확인했다. 처리 과정에서 태그 자체는 버려졌기
+    // 때문에, 박스 안에서 유일하게 일치하는 좌표 시그니처로 다시 식별해 표시한다.
+    // (짧은 소규모 배수로 교량 3곳은 인접 도로 조각과 경계가 겹쳐 시그니처로 특정하기
+    // 어렵고 시각적 영향도 미미해 이번엔 반영하지 않음 — 필요하면 알려달라고 안내함.)
+    var KNOWN_BRIDGE_SIGNATURES = [
+      { firstPt: [73.9, -209.4], count: 9 }
+    ];
+    TD.roads.forEach(function(road){
+      KNOWN_BRIDGE_SIGNATURES.forEach(function(sig){
+        var p0 = road.pts[0];
+        if (road.pts.length === sig.count && p0 &&
+            Math.abs(p0[0]-sig.firstPt[0]) < 0.5 && Math.abs(p0[1]-sig.firstPt[1]) < 0.5){
+          road.bridge = true;
+        }
+      });
+    });
+
+    // 배경 좌표계는 물리 시뮬레이션의 NED와 동일하게 X=East, Z=-North, Y=고도(기준점 대비 상대값).
+    function sampleHeight(worldX, worldZ){
+      var north = -worldZ;
+      var fx = Math.min(1, Math.max(0, (worldX/HALF + 1) / 2));
+      var fz = Math.min(1, Math.max(0, (north/HALF + 1) / 2));
+      var gx = fx * SEGS, gz = fz * SEGS;
+      var ix0 = Math.floor(gx), iz0 = Math.floor(gz);
+      var ix1 = Math.min(ix0 + 1, SEGS), iz1 = Math.min(iz0 + 1, SEGS);
+      var tx = gx - ix0, tz = gz - iz0;
+      var h00 = TD.heights[iz0*N+ix0], h10 = TD.heights[iz0*N+ix1];
+      var h01 = TD.heights[iz1*N+ix0], h11 = TD.heights[iz1*N+ix1];
+      var hx0 = h00*(1-tx) + h10*tx, hx1 = h01*(1-tx) + h11*tx;
+      return hx0*(1-tz) + hx1*tz;
+    }
+
+    function pointInPolygon(pe, pn, poly){
+      var inside = false;
+      for (var i = 0, j = poly.length - 1; i < poly.length; j = i++){
+        var ei = poly[i][0], ni = poly[i][1], ej = poly[j][0], nj = poly[j][1];
+        var hit = ((ni > pn) !== (nj > pn)) && (pe < (ej - ei) * (pn - ni) / (nj - ni) + ei);
+        if (hit) inside = !inside;
+      }
+      return inside;
+    }
+
+    // 건물 기준고도(baseY)를 여기서 한 번만 계산해 building 객체에 붙여둔다 —
+    // 렌더러(메시 배치)와 물리(지붕 충돌)가 항상 같은 값을 쓰도록 보장하기 위함.
+    TD.buildings.forEach(function(b){
+      var cx = 0, cnorth = 0;
+      b.pts.forEach(function(p){ cx += p[0]; cnorth += p[1]; });
+      cx /= b.pts.length; cnorth /= b.pts.length;
+      b.centroidEast = cx;
+      b.centroidNorth = cnorth;
+      b.baseY = sampleHeight(cx, -cnorth);
+      // 렌더링용 바닥은 건물 외곽선의 최저 지형보다 살짝 아래로 둔다. 기존처럼
+      // 넓은 별도 기초(plinth)를 두면 그 기초가 검은 띠로 보였으므로, 본체 벽만
+      // 지형에 0.15m 묻어 접촉 오차를 흡수한다. baseY는 충돌/지붕 계산용으로 유지.
+      var minGround = b.baseY;
+      b.pts.forEach(function(p, i){
+        var next = b.pts[(i + 1) % b.pts.length];
+        for (var t = 0; t <= 1; t += 0.25){
+          var e = p[0] + (next[0] - p[0]) * t;
+          var n = p[1] + (next[1] - p[1]) * t;
+          minGround = Math.min(minGround, sampleHeight(e, -n));
+        }
+      });
+      b.renderBaseY = minGround - 0.15;
+    });
+
+    function buildingRoofAt(east, north){
+      var roof = null;
+      for (var i = 0; i < TD.buildings.length; i++){
+        var b = TD.buildings[i];
+        if (pointInPolygon(east, north, b.pts)){
+          var topY = b.baseY + b.h;
+          if (roof === null || topY > roof) roof = topY;
+        }
+      }
+      return roof;
+    }
+
+    var ROAD_COLLIDERS = [];
+    TD.roads.forEach(function(road){
+      var halfW = (road.tier === "major" ? ROAD_WIDTH.major : ROAD_WIDTH.minor) / 2;
+      for (var i = 0; i < road.pts.length - 1; i++){
+        var a = road.pts[i], b2 = road.pts[i+1];
+        var de = b2[0]-a[0], dn = b2[1]-a[1];
+        var len = Math.sqrt(de*de + dn*dn);
+        if (len < 0.01) continue;
+        var cx = (a[0]+b2[0])/2, cn = (a[1]+b2[1])/2;
+        ROAD_COLLIDERS.push({
+          cx: cx, cn: cn, halfLen: len/2, halfW: halfW,
+          angle: Math.atan2(dn, de),
+          surfaceY: sampleHeight(cx, -cn) + 0.25
+        });
+      }
+    });
+
+    function roadSurfaceAt(east, north){
+      var top = null;
+      for (var i = 0; i < ROAD_COLLIDERS.length; i++){
+        var rc = ROAD_COLLIDERS[i];
+        var dx = east - rc.cx, dn = north - rc.cn;
+        var ca = Math.cos(rc.angle), sa = Math.sin(rc.angle);
+        var along = dx*ca + dn*sa;
+        var across = -dx*sa + dn*ca;
+        if (Math.abs(along) <= rc.halfLen && Math.abs(across) <= rc.halfW){
+          if (top === null || rc.surfaceY > top) top = rc.surfaceY;
+        }
+      }
+      return top;
+    }
+
+    // 해당 지점에서 기체가 내려갈 수 있는 최저 고도(지형/도로/지붕 중 가장 높은 것).
+    // 고가도로(road.bridge)는 렌더러가 상판을 띄워서 "그리는" 것과 별개로 여기서는
+    // 여전히 자연 지형고도를 floor로 쓴다 — 실제 고가도로처럼 그 아래 공간을 그대로
+    // 비행 가능하게 두기 위한 의도적 단순화(대신 상판 위에 정확히 착지하는 것은
+    // 별도로 모델링하지 않음).
+    function floorHeightAt(east, north){
+      var floor = sampleHeight(east, -north);
+      var road = roadSurfaceAt(east, north);
+      if (road !== null && road > floor) floor = road;
+      var roof = buildingRoofAt(east, north);
+      if (roof !== null && roof > floor) floor = roof;
+      return floor;
+    }
+
+    return {
+      data: TD,
+      gridN: N, halfSize: HALF, segs: SEGS, size: SIZE,
+      minHeight: MIN_H, maxHeight: MAX_H, roadWidth: ROAD_WIDTH,
+      bridgeClearance: BRIDGE_CLEARANCE,
+      sampleHeight: sampleHeight,
+      pointInPolygon: pointInPolygon,
+      floorHeightAt: floorHeightAt
+    };
+  })(TERRAIN_DATA);
+
+
+  // ==============================================================================
+  // VEHICLE 모듈 #1: 쿼드콥터 (MC) — 기존 물리 그대로, 계약 형태로만 재구성
+  // ==============================================================================
+  function createQuadrotorVehicle(){
+    var G = 9.81;
+    var MAX_TILT = 35 * Math.PI/180;
+    var ATT_TAU = 0.15;
+    var YAW_RATE_MAX = 150 * Math.PI/180;
+    var YAW_TAU = 0.2;
+    var CLIMB_UP_MAX = 3.0;
+    var CLIMB_DN_MAX = 1.5;
+    var Z_TAU = 0.2;
+    var XY_VEL_MAX = 12.0;
+    var DRAG_K = (G * Math.tan(MAX_TILT)) / XY_VEL_MAX;
+
+    function lerp1(cur, target, dt, tau){ return cur + (target - cur) * Math.min(1, dt / tau); }
+
+    return {
+      id: "quadrotor",
+      label: "쿼드콥터 (MC)",
+      maxAlt: 200,
+      initialExtraState: function(){ return { tilt: 0 }; },
+      computeDynamics: function(state, rcCmd, dt){
+        var pitchTarget = rcCmd.pitch * MAX_TILT;
+        var rollTarget  = rcCmd.roll * MAX_TILT;
+        var yawRateTarget = rcCmd.yaw * YAW_RATE_MAX;
+        var climbTarget = rcCmd.thr > 0 ? rcCmd.thr * CLIMB_UP_MAX : rcCmd.thr * CLIMB_DN_MAX;
+
+        state.pitch = lerp1(state.pitch, pitchTarget, dt, ATT_TAU);
+        state.roll  = lerp1(state.roll, rollTarget, dt, ATT_TAU);
+        state.yawRate = lerp1(state.yawRate, yawRateTarget, dt, YAW_TAU);
+        state.climbRate = lerp1(state.climbRate, climbTarget, dt, Z_TAU);
+
+        state.heading += state.yawRate * dt;
+        var twoPi = Math.PI * 2;
+        state.heading = ((state.heading % twoPi) + twoPi) % twoPi;
+
+        var aBx = G * Math.tan(state.pitch);
+        var aBy = G * Math.tan(state.roll);
+        var cH = Math.cos(state.heading), sH = Math.sin(state.heading);
+        var aN = aBx * cH - aBy * sH;
+        var aE = aBx * sH + aBy * cH;
+
+        state.vN += (aN - DRAG_K * state.vN) * dt;
+        state.vE += (aE - DRAG_K * state.vE) * dt;
+
+        state.tilt = 0; // 쿼드콥터는 틸트 기구가 없음 — 항상 수직 로터
+      },
+      geometry: {
+        bodySize: {x:1.0, y:0.32, z:1.5},
+        hasWings: false,
+        motors: [
+          {x:0.9,  z:-0.9, tiltable:false},
+          {x:-0.9, z:-0.9, tiltable:false},
+          {x:0.9,  z:0.9,  tiltable:false},
+          {x:-0.9, z:0.9,  tiltable:false}
+        ]
+      },
+      controlHint: null
+    };
+  }
+
+
+  // ==============================================================================
+  // VEHICLE 모듈 #2: 틸트로터 (VTOL) — 집단 틸트각(0=수직/MC, 1=수평/FW)에 따라
+  // 멀티콥터식 벡터추력과 고정익식 추력-양력 모델을 선형 블렌딩하는 단순화 모델.
+  // 실제 tv_att_control/tv_pos_control 수준의 정밀 전이 모델은 아니고, 구조 검증용 근사치.
+  // ==============================================================================
+  function createTiltrotorVehicle(){
+    var G = 9.81;
+    var MAX_TILT_ATT = 30 * Math.PI/180;
+    var ATT_TAU = 0.18;
+    var YAW_RATE_MAX = 120 * Math.PI/180;
+    var YAW_TAU = 0.25;
+    var CLIMB_UP_MAX = 4.0;
+    var CLIMB_DN_MAX = 2.0;
+    var Z_TAU = 0.25;
+    var XY_VEL_MAX_MC = 10.0;
+    var DRAG_K_MC = (G * Math.tan(MAX_TILT_ATT)) / XY_VEL_MAX_MC;
+    var FW_CRUISE_MAX = 35.0;              // 고정익 모드 최고속도(m/s)
+    var FW_THRUST_ACCEL_MAX = 6.0;         // 고정익 모드 최대 추력가속(m/s^2)
+    var FW_DRAG_K = FW_THRUST_ACCEL_MAX / (FW_CRUISE_MAX*FW_CRUISE_MAX);
+    var STALL_SPEED = 8.0;                 // 이 속도 미만이면 고정익 양력 상실(단순화)
+    var TILT_TAU = 1.2;                    // 틸트 액추에이터 응답(실제 서보처럼 느림)
+    var TILT_RATE = 0.6;                   // Q/E 입력 -> 목표 틸트 변화 속도(1/s, 0..1 스케일)
+
+    function lerp1(cur, target, dt, tau){ return cur + (target - cur) * Math.min(1, dt / tau); }
+    function clamp01(v){ return Math.max(0, Math.min(1, v)); }
+
+    return {
+      id: "tiltrotor",
+      label: "틸트로터 (VTOL)",
+      maxAlt: 300,
+      initialExtraState: function(){ return { tilt:0, tiltTarget:0 }; },
+      computeDynamics: function(state, rcCmd, dt){
+        // 집단 틸트각: Q/E로 목표치를 증감시키고, 실제 서보처럼 시간지연을 두고 따라간다.
+        state.tiltTarget = clamp01((state.tiltTarget||0) + (rcCmd.tilt||0) * dt * TILT_RATE);
+        state.tilt = lerp1(state.tilt||0, state.tiltTarget, dt, TILT_TAU);
+        var tilt = state.tilt;
+
+        var pitchTarget = rcCmd.pitch * MAX_TILT_ATT * (1 - 0.3*tilt);
+        var rollTarget  = rcCmd.roll * MAX_TILT_ATT;
+        var yawRateTarget = rcCmd.yaw * YAW_RATE_MAX * (1 - 0.5*tilt);
+
+        state.pitch = lerp1(state.pitch, pitchTarget, dt, ATT_TAU);
+        state.roll  = lerp1(state.roll, rollTarget, dt, ATT_TAU);
+        state.yawRate = lerp1(state.yawRate, yawRateTarget, dt, YAW_TAU);
+
+        state.heading += state.yawRate * dt;
+        var twoPi = Math.PI * 2;
+        state.heading = ((state.heading % twoPi) + twoPi) % twoPi;
+
+        var speed = Math.sqrt(state.vN*state.vN + state.vE*state.vE);
+
+        // MC 성분(tilt=0에서 100%): 자세각 기반 벡터추력 — 쿼드콥터와 동일 원리
+        var mcAccelFwd = G * Math.tan(state.pitch);
+        var mcAccelLat = G * Math.tan(state.roll);
+
+        // FW 성분(tilt=1에서 100%): 스로틀=전방추력(속도제곱 항력으로 최고속도 제한), 롤=선회
+        var thr = rcCmd.thr > 0 ? rcCmd.thr : 0; // 고정익 모드는 역추력 없음(단순화)
+        var fwAccelFwd = thr * FW_THRUST_ACCEL_MAX - FW_DRAG_K * speed * speed;
+        var fwAccelLat = G * Math.tan(state.roll) * 0.6;
+
+        var aBx = mcAccelFwd*(1-tilt) + fwAccelFwd*tilt;
+        var aBy = mcAccelLat*(1-tilt) + fwAccelLat*tilt;
+
+        var cH = Math.cos(state.heading), sH = Math.sin(state.heading);
+        var aN = aBx*cH - aBy*sH;
+        var aE = aBx*sH + aBy*cH;
+
+        var dragK = DRAG_K_MC * (1-tilt); // FW 모드는 위 항력항이 이미 처리하므로 추가 감쇠 불필요
+        state.vN += (aN - dragK*state.vN) * dt;
+        state.vE += (aE - dragK*state.vE) * dt;
+
+        // 승강: MC는 스로틀이 곧 상승률, FW는 실속속도 이상에서만 피치로 양력(단순화), 이하는 강하
+        var mcClimb = rcCmd.thr > 0 ? rcCmd.thr*CLIMB_UP_MAX : rcCmd.thr*CLIMB_DN_MAX;
+        var fwClimb = speed > STALL_SPEED ? rcCmd.pitch * (speed/20) * 4.0 : -2.0;
+        var climbTarget = mcClimb*(1-tilt) + fwClimb*tilt;
+        state.climbRate = lerp1(state.climbRate, climbTarget, dt, Z_TAU);
+      },
+      geometry: {
+        bodySize: {x:0.9, y:0.34, z:2.2},
+        hasWings: true, wingSpan:3.2, wingChord:0.55,
+        motors: [
+          {x:1.1,  z:-0.5, tiltable:true},
+          {x:-1.1, z:-0.5, tiltable:true},
+          {x:1.1,  z:0.9,  tiltable:true},
+          {x:-1.1, z:0.9,  tiltable:true}
+        ]
+      },
+      controlHint: "Q/E: 틸트(수직&harr;수평)"
+    };
+  }
+
+  var VEHICLES = [createQuadrotorVehicle(), createTiltrotorVehicle()];
+
+
+  // ==============================================================================
+  // MODULE: FlightSim — 공통 비행 루프 (RC 입력 -> Vehicle.computeDynamics -> 위치적분
+  // -> 지형/건물/경계 충돌 -> 고도제한). 기체가 바뀌어도 이 모듈은 그대로 재사용된다.
+  // ==============================================================================
+  var FlightSim = (function(World){
+    var MAP_BOUND = World.halfSize;
+
+    // ICD-PXTR-HILS-001, 9.4 통합 파라미터 목록의 전송 주기(Hz)를 그대로 사용.
+    var ICD_RATE = {
+      D01_RC:      10,   // D-01 RC_CHANNELS (조종기->FCC, 검증용)
+      C01_POS:     20,   // C-01 GLOBAL_POSITION_INT (중간값, 10~30Hz)
+      C02_ATT:     60,   // C-02 ATTITUDE_QUATERNION (중간값, 50~100Hz)
+      C03_SPD:     15,   // C-03 VFR_HUD airspeed (중간값, 10~20Hz)
+      C04_HDG:     15,   // C-04 VFR_HUD heading (중간값, 10~20Hz)
+      C06_TILT:    20    // C-06 HIL_TILT_STATE 재송출
+    };
+
+    var state = {
+      roll:0, pitch:0, yawRate:0, heading:0,
+      vN:0, vE:0, north:0, east:0,
+      climbRate:0, alt:0
+    };
+    var activeVehicle = null;
+
+    // 채널 D(D-01, 조종기->FCC): 실제 키 입력은 매 프레임 샘플링(컴퓨팅)되지만,
+    // ICD 상 RC_CHANNELS 전송 주기(10Hz)로만 FCC가 새 값을 수신한다고 가정 -> sample&hold.
+    // pitch/roll/yaw/thr는 표준 4축, tilt는 기체가 틸트 기구를 가진 경우에만 의미를 갖는
+    // 5번째 축(Q/E) — 쿼드콥터는 그냥 무시한다.
+    var rcCmd = { pitch:0, roll:0, yaw:0, thr:0, tilt:0 };
+    var rcAccum = 0;
+    var keys = Object.create(null);
+    var onRcSample = null;   // HUD가 등록하는 콜백 (RC 링크 점멸 표시용)
+    var onReset = null;      // HUD가 등록하는 콜백 (텔레메트리 누산기 초기화용)
+
+    window.addEventListener("keydown", function(e){
+      if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].indexOf(e.key) !== -1) e.preventDefault();
+      keys[e.key.toLowerCase()] = true;
+      if (e.key.toLowerCase() === "r"){
+        resetState();
+        if (onReset) onReset();
+      }
+    }, {passive:false});
+    window.addEventListener("keyup", function(e){
+      keys[e.key.toLowerCase()] = false;
+    });
+
+    function applyVehicleInitialState(vehicle){
+      state.roll=0; state.pitch=0; state.yawRate=0; state.heading=0;
+      state.vN=0; state.vE=0; state.north=0; state.east=0;
+      state.climbRate=0; state.alt=0;
+      var extra = vehicle.initialExtraState ? vehicle.initialExtraState() : {};
+      for (var k in extra) state[k] = extra[k];
+    }
+
+    function setVehicle(vehicle){
+      activeVehicle = vehicle;
+      applyVehicleInitialState(vehicle);
+      rcCmd.pitch=0; rcCmd.roll=0; rcCmd.yaw=0; rcCmd.thr=0; rcCmd.tilt=0;
+      rcAccum=0;
+    }
+
+    function resetState(){
+      applyVehicleInitialState(activeVehicle);
+      rcCmd.pitch=0; rcCmd.roll=0; rcCmd.yaw=0; rcCmd.thr=0; rcCmd.tilt=0;
+      rcAccum=0;
+    }
+
+    function sampleRcChannel(dt){
+      rcAccum += dt;
+      var interval = 1 / ICD_RATE.D01_RC;
+      if (rcAccum >= interval){
+        rcAccum -= interval;
+        rcCmd.pitch = (keys["arrowup"] ? 1 : 0) - (keys["arrowdown"] ? 1 : 0);
+        rcCmd.roll  = (keys["arrowright"] ? 1 : 0) - (keys["arrowleft"] ? 1 : 0);
+        rcCmd.yaw   = (keys["d"] ? 1 : 0) - (keys["a"] ? 1 : 0);
+        rcCmd.thr   = (keys["w"] ? 1 : 0) - (keys["s"] ? 1 : 0);
+        rcCmd.tilt  = (keys["e"] ? 1 : 0) - (keys["q"] ? 1 : 0);
+        if (onRcSample) onRcSample();
+      }
+    }
+
+    function step(dt){
+      sampleRcChannel(dt);
+      activeVehicle.computeDynamics(state, rcCmd, dt);
+
+      var prevNorth = state.north, prevEast = state.east;
+      state.north += state.vN * dt;
+      state.east  += state.vE * dt;
+
+      // 매핑 범위(500m x 500m) 경계 — 벗어나려는 방향의 속도 성분만 제거해 그 자리에서 막는다.
+      if (state.east > MAP_BOUND){ state.east = MAP_BOUND; if (state.vE > 0) state.vE = 0; }
+      if (state.east < -MAP_BOUND){ state.east = -MAP_BOUND; if (state.vE < 0) state.vE = 0; }
+      if (state.north > MAP_BOUND){ state.north = MAP_BOUND; if (state.vN > 0) state.vN = 0; }
+      if (state.north < -MAP_BOUND){ state.north = -MAP_BOUND; if (state.vN < 0) state.vN = 0; }
+
+      state.alt += state.climbRate * dt;
+
+      // 지형/도로/건물 지붕 중 가장 높은 면 = 이 위치의 "바닥". 현재 고도가 그 바닥보다
+      // 낮은 곳으로 수평 이동하면(완만한 경사라도) 지형/건물 옆면에 부딪힌 것으로 보고
+      // 수평 이동을 취소(직전 위치로 복귀, 속도 0)한다.
+      var floorAtNew = World.floorHeightAt(state.east, state.north);
+      if (floorAtNew > state.alt + 1e-3){
+        state.north = prevNorth; state.east = prevEast;
+        state.vN = 0; state.vE = 0;
+      } else if (state.alt < floorAtNew){
+        state.alt = floorAtNew;
+        if (state.climbRate < 0) state.climbRate = 0;
+      }
+
+      var maxAlt = activeVehicle.maxAlt || 200;
+      if (state.alt > maxAlt){ state.alt = maxAlt; if (state.climbRate > 0) state.climbRate = 0; }
+    }
+
+    return {
+      state: state,
+      rcCmd: rcCmd,
+      ICD_RATE: ICD_RATE,
+      get vehicle(){ return activeVehicle; },
+      setVehicle: setVehicle,
+      step: step,
+      resetState: resetState,
+      setOnRcSample: function(fn){ onRcSample = fn; },
+      setOnReset: function(fn){ onReset = fn; }
+    };
+  })(WorldModel);
+
+  FlightSim.setVehicle(VEHICLES[0]);
+
+
+  // ==============================================================================
+  // MODULE: TargetDrone — 추격 훈련용 타겟 기체 (플레이어가 계속 쫓아가며 조종 연습을 하는 대상).
+  //
+  // FlightSim(위)은 RC 입력 샘플링 + ICD 채널 시뮬레이션까지 포함한 "플레이어 전용 싱글턴"이라,
+  // 그대로 두 번째 인스턴스를 만들면 같은 키보드 입력(keys/rcCmd)을 공유해버려서 플레이어 조종을
+  // 덮어쓰게 된다. 타겟은 그 정밀도가 필요 없으므로(등속도 비행이면 충분) FlightSim과 완전히
+  // 분리된 단순 운동 모델로 만들었다. WorldModel(지형/도로/건물 질의)만 공유해서 재사용한다.
+  //
+  // ------------------------------ TARGET PROFILE 계약 ---------------------------------
+  //   label                : 버튼/상태창에 표시할 이름
+  //   geometry             : 렌더러가 그릴 형상 (Vehicle.geometry와 동일 형식 — buildCraft() 재사용)
+  //   cruiseSpeed          : 자동비행 기본 순항속도(m/s) — "기본적인 세팅", 언제든 조정 가능
+  //   maxSpeed / minSpeed  : 등속도 운동의 상/하한(m/s). "최대 50m/s" 요구사항을 여기서 강제한다.
+  //   turnRateMax          : rad/s — 자동/수동 공통 선회율 상한
+  //   climbRateMax         : m/s
+  //   ceiling              : m — 이 타겟의 최대 운용고도(플레이어 기체의 maxAlt와는 별개 값)
+  //   canHover             : true=쿼드형(뱅크 없이 제자리 선회 가능),
+  //                          false=고정익형(뱅크턴만 가능·실속방지 최소속도 minSpeed 적용)
+  //   bankMax              : rad — 고정익 전용 시각적 뱅크각 상한(canHover=false일 때만 사용)
+  //
+  // 새 타겟 형상을 추가하려면 TARGET_PROFILES에 항목 하나만 추가하면 된다. 아래 step 로직은
+  // canHover 플래그로 "쿼드형/고정익형" 두 운동 모델만 분기하므로, 대부분의 새 프로필은
+  // 이 숫자들만 조정해도 충분하다 — 나중에 값 튜닝은 이 표에서만 하면 된다.
+  //
+  // 조종 방식 두 가지:
+  //   mode="auto"   — 지도(500m) 안에서 무작위로 방위각/고도를 재설정해가며 자율비행(랜덤워크).
+  //   mode="manual" — 별도 조종사가 IJKL(선회/승강)+U/O(속도)로 직접 조종. 플레이어의
+  //                   화살표/WASD/QE와 겹치지 않는 키만 골랐다(MANUAL_KEYS에서 재배정 가능).
+  //
+  // 알려진 단순화(나중에 필요하면 이 모듈만 고쳐서 개선 가능):
+  //   - 지형/도로/건물 "지붕" 충돌만 반영한다(WorldModel.floorHeightAt 재사용). 플레이어처럼
+  //     건물 옆면에 부딪혀 정지하는 수평 충돌은 넣지 않았다 — 낮은 고도로 접근하면 지붕 위로
+  //     자연스럽게 "떠오르는" 정도로만 처리된다.
+  //   - 경계(500m) 근처에서는 안쪽으로 편향된 방향을 우선 골라 자연스럽게 방향을 틀게 하고,
+  //     그래도 경계에 닿으면 좌표를 강제로 눌러 넣는다(플레이어와 동일한 최후 안전장치).
+  // ==============================================================================
+  var TargetDrone = (function(World){
+    var DEG = Math.PI/180;
+
+    var TARGET_PROFILES = {
+      quad: {
+        label: "쿼드콥터",
+        geometry: {
+          bodySize: {x:1.0, y:0.32, z:1.5}, hasWings:false,
+          motors: [
+            {x:0.9,  z:-0.9, tiltable:false}, {x:-0.9, z:-0.9, tiltable:false},
+            {x:0.9,  z:0.9,  tiltable:false}, {x:-0.9, z:0.9,  tiltable:false}
+          ]
+        },
+        cruiseSpeed: 15, maxSpeed: 50, minSpeed: 0,
+        turnRateMax: 90*DEG, climbRateMax: 5, ceiling: 150,
+        canHover: true, bankMax: 0
+      },
+      fixedwing: {
+        label: "고정익",
+        geometry: {
+          bodySize: {x:0.9, y:0.34, z:2.2}, hasWings:true, wingSpan:3.2, wingChord:0.55,
+          motors: [ {x:1.0, z:0.0, tiltable:false}, {x:-1.0, z:0.0, tiltable:false} ]
+        },
+        cruiseSpeed: 22, maxSpeed: 50, minSpeed: 12,
+        turnRateMax: 30*DEG, climbRateMax: 4, ceiling: 150,
+        canHover: false, bankMax: 45*DEG
+      }
+    };
+
+    // 수동 조종 시 사용하는 키 — 플레이어 조작(화살표/WASD/QE)과 겹치지 않도록 별도 배정.
+    // 나중에 바꾸고 싶으면 이 표만 고치면 된다.
+    var MANUAL_KEYS = { turnLeft:"j", turnRight:"l", climbUp:"i", climbDown:"k", speedDown:"u", speedUp:"o" };
+
+    var profileKey = "quad";
+    var mode = "auto"; // "auto" | "manual"
+    var onProfileChange = null; // 렌더러가 형상 재구성을 위해 등록하는 콜백
+
+    var state = {
+      active: true,           // false면 렌더러가 메시를 숨긴다
+      east:0, north:0, alt:40, heading:0,
+      speed:0, bank:0,         // bank는 고정익 전용 시각 효과(쿼드는 항상 0)
+      tilt:0                   // 현재 두 프로필 다 사용 안 하지만, 렌더러 계약과 맞추기 위해 유지
+    };
+
+    // 자동비행(랜덤워크)용 내부 목표값 — 일정 시간마다 새로 뽑는다.
+    var auto = { headingTarget:0, altTarget:40, retargetTimer:0 };
+    var turnCmdNorm = 0; // -1..1, "지금 얼마나 세게 선회 중인가" — 뱅크 시각화에 공용으로 사용
+
+    var keys = Object.create(null);
+    window.addEventListener("keydown", function(e){ keys[e.key.toLowerCase()] = true; });
+    window.addEventListener("keyup",   function(e){ keys[e.key.toLowerCase()] = false; });
+
+    function profile(){ return TARGET_PROFILES[profileKey]; }
+
+    function wrapPi(a){
+      var twoPi = Math.PI*2;
+      return ((a + Math.PI) % twoPi + twoPi) % twoPi - Math.PI;
+    }
+
+    // 무작위 재목표 설정 — 지도 경계(500m)에 가까울수록 중심 쪽으로 편향된 방향을 골라서
+    // 타겟이 경계에 자꾸 갇히지 않고 자연스럽게 안쪽으로 돌아오게 한다.
+    function pickNewAutoTargets(p){
+      var distFromCenter = Math.sqrt(state.east*state.east + state.north*state.north);
+      var towardCenter = Math.atan2(-state.east, -state.north);
+      var edgeBias = Math.min(1, Math.max(0, (distFromCenter - World.halfSize*0.55) / (World.halfSize*0.4)));
+      var randomHeading = Math.random()*Math.PI*2 - Math.PI;
+      auto.headingTarget = wrapPi(towardCenter*edgeBias + randomHeading*(1-edgeBias));
+
+      var floorNow = World.floorHeightAt(state.east, state.north);
+      var altLow = Math.max(floorNow + 15, 20);
+      var altHigh = Math.min(p.ceiling - 10, altLow + 80);
+      auto.altTarget = altLow + Math.random()*Math.max(5, altHigh-altLow);
+      auto.retargetTimer = 4 + Math.random()*6; // 4~10초마다 재설정
+    }
+
+    function stepAuto(p, dt){
+      auto.retargetTimer -= dt;
+      if (auto.retargetTimer <= 0) pickNewAutoTargets(p);
+
+      var diff = wrapPi(auto.headingTarget - state.heading);
+      var maxStep = p.turnRateMax * dt;
+      var applied = Math.max(-maxStep, Math.min(maxStep, diff));
+      state.heading = wrapPi(state.heading + applied);
+      turnCmdNorm = maxStep > 0 ? applied/maxStep : 0;
+
+      var altDiff = auto.altTarget - state.alt;
+      var altStep = p.climbRateMax * dt;
+      state.alt = Math.abs(altDiff) <= altStep ? auto.altTarget : state.alt + Math.sign(altDiff)*altStep;
+
+      state.speed += (p.cruiseSpeed - state.speed) * Math.min(1, dt/1.0);
+    }
+
+    function stepManual(p, dt){
+      var turnIn  = (keys[MANUAL_KEYS.turnRight] ? 1:0) - (keys[MANUAL_KEYS.turnLeft] ? 1:0);
+      var climbIn = (keys[MANUAL_KEYS.climbUp]   ? 1:0) - (keys[MANUAL_KEYS.climbDown]? 1:0);
+      var spdIn   = (keys[MANUAL_KEYS.speedUp]   ? 1:0) - (keys[MANUAL_KEYS.speedDown]? 1:0);
+
+      turnCmdNorm = turnIn;
+      state.heading = wrapPi(state.heading + turnIn * p.turnRateMax * dt);
+      state.alt += climbIn * p.climbRateMax * dt;
+      state.speed += spdIn * (p.maxSpeed - p.minSpeed) * 0.4 * dt;
+    }
+
+    function step(dt){
+      if (!state.active) return;
+      var p = profile();
+
+      if (mode === "auto") stepAuto(p, dt); else stepManual(p, dt);
+
+      state.speed = Math.max(p.minSpeed, Math.min(p.maxSpeed, state.speed));
+      state.bank = p.canHover ? 0 : Math.max(-p.bankMax, Math.min(p.bankMax, turnCmdNorm * p.bankMax));
+
+      // 등속도 운동: 매 프레임 heading 방향으로 speed만큼 전진(가감속 모델 없음 — 요구사항 그대로).
+      state.east  += Math.sin(state.heading) * state.speed * dt;
+      state.north += Math.cos(state.heading) * state.speed * dt;
+
+      // 경계(500m) 안전장치 — auto 모드는 위 edgeBias 조향으로 대부분 걸리지 않지만,
+      // manual 조종이나 극단적인 경우를 대비해 최후 수단으로 좌표를 눌러 넣는다.
+      var B = World.halfSize;
+      state.east  = Math.max(-B, Math.min(B, state.east));
+      state.north = Math.max(-B, Math.min(B, state.north));
+
+      // 지형/도로/건물 지붕 중 가장 높은 면(WorldModel 공용 질의) 아래로는 내려가지 않는다.
+      var floorHere = World.floorHeightAt(state.east, state.north);
+      if (state.alt < floorHere) state.alt = floorHere;
+      if (state.alt > p.ceiling) state.alt = p.ceiling;
+    }
+
+    function setProfile(key){
+      if (!TARGET_PROFILES[key] || key === profileKey){ return; }
+      profileKey = key;
+      state.bank = 0; turnCmdNorm = 0;
+      // 형상만 바뀌고 위치/고도/속도는 그대로 유지 — 비행 중 형상을 바꿔도 자연스럽게 이어진다.
+      if (onProfileChange) onProfileChange(TARGET_PROFILES[key]);
+    }
+
+    function setMode(m){
+      if (m !== "auto" && m !== "manual") return;
+      mode = m;
+      if (m === "auto") pickNewAutoTargets(profile());
+    }
+
+    // 지도 안 임의 위치로 재배치. playerSim(FlightSim)을 넘기면 플레이어와 최소 60m 거리를
+    // 두어 바로 코앞에 나타나지 않게 한다(생략 가능 — 완전 무작위로 배치됨).
+    function respawn(playerSim){
+      var p = profile();
+      var e, n, tries = 0;
+      do {
+        e = (Math.random()*2 - 1) * World.halfSize * 0.8;
+        n = (Math.random()*2 - 1) * World.halfSize * 0.8;
+        tries++;
+      } while (playerSim && Math.hypot(e-playerSim.state.east, n-playerSim.state.north) < 60 && tries < 20);
+
+      state.east = e; state.north = n;
+      state.heading = Math.random()*Math.PI*2 - Math.PI;
+      state.alt = Math.max(World.floorHeightAt(e, n) + 30, 30);
+      state.speed = p.cruiseSpeed;
+      state.bank = 0; turnCmdNorm = 0;
+      state.active = true;
+      pickNewAutoTargets(p);
+    }
+
+    return {
+      state: state,
+      TARGET_PROFILES: TARGET_PROFILES,
+      MANUAL_KEYS: MANUAL_KEYS,
+      get profileKey(){ return profileKey; },
+      get profile(){ return profile(); },
+      get mode(){ return mode; },
+      step: step,
+      setProfile: setProfile,
+      setMode: setMode,
+      respawn: respawn,
+      setOnProfileChange: function(fn){ onProfileChange = fn; }
+    };
+  })(WorldModel);
+
+
+  // ==============================================================================
+  // 렌더러 구현체 #1: Three.js/WebGL — 위 "RENDERER 계약"의 6개 메서드만 구현한다.
+  // 이 함수 전체가 렌더링 엔진에 종속된 유일한 부분이다.
+  // ==============================================================================
+  function createThreeJsRenderer(){
+    var world, scene, camera, renderer, canvas;
+    var ambientLight, sun;
+    var craft, compassGroup;
+    var targetCraft = null, targetNacelles = [];
+    var tiltableNacelles = [];
+    var CAM_DIST = 9, CAM_HEIGHT = 4.2;
+    var FOG_NEAR = 45, FOG_FAR = 230;
+
+    // 시간대 프리셋 — 완벽한 대기 시뮬레이션은 아니고, 하늘색/조명만 바꿔서
+    // 하늘과 땅이 시간대에 따라 구별되도록 하는 정도의 단순화된 연출.
+    var SKY_PRESETS = {
+      dawn:   { sky:0x2a3550, ambient:0x3a4560, ambientI:0.55, sun:0x8fa8d0, sunI:0.35, sunPos:[-60,15,40] },
+      morning:{ sky:0x5f8fc4, ambient:0x5a7088, ambientI:0.85, sun:0xfff2d9, sunI:0.70, sunPos:[-40,40,30] },
+      noon:   { sky:0x4fa8e8, ambient:0x6a8598, ambientI:1.00, sun:0xffffff, sunI:0.95, sunPos:[-20,80,10] },
+      sunset: { sky:0xc06a45, ambient:0x5a4438, ambientI:0.60, sun:0xffa15c, sunI:0.55, sunPos:[60,12,-40] },
+      night:  { sky:0x0a0e14, ambient:0x2a3038, ambientI:0.40, sun:0x8fa0c0, sunI:0.20, sunPos:[-30,60,20] }
+    };
+
+    function setTimeOfDay(key){
+      var p = SKY_PRESETS[key];
+      if (!p) return;
+      scene.background = new THREE.Color(p.sky);
+      scene.fog = new THREE.Fog(p.sky, FOG_NEAR, FOG_FAR);
+      ambientLight.color.setHex(p.ambient);
+      ambientLight.intensity = p.ambientI;
+      sun.color.setHex(p.sun);
+      sun.intensity = p.sunI;
+      sun.position.set(p.sunPos[0], p.sunPos[1], p.sunPos[2]);
+    }
+
+    // 점 (px,pz) 에서 선분 (ax,az)-(bx,bz) 까지의 최단 거리 — 지형 접지 음영(AO) 계산용.
+    function distToSegment(px, pz, ax, az, bx, bz){
+      var dx = bx-ax, dz = bz-az;
+      var lenSq = dx*dx + dz*dz;
+      var t = lenSq > 1e-6 ? ((px-ax)*dx + (pz-az)*dz) / lenSq : 0;
+      t = Math.max(0, Math.min(1, t));
+      var cx = ax + t*dx, cz = az + t*dz;
+      var ddx = px-cx, ddz = pz-cz;
+      return Math.sqrt(ddx*ddx + ddz*ddz);
+    }
+
+    function buildTerrain(){
+      var TD = world.data;
+      var farFloor = new THREE.Mesh(
+        new THREE.PlaneGeometry(4000, 4000),
+        new THREE.MeshStandardMaterial({color:0x141c22, roughness:1})
+      );
+      farFloor.rotation.x = -Math.PI/2;
+      farFloor.position.y = world.minHeight - 4;
+      scene.add(farFloor);
+
+      var terrainGeo = new THREE.PlaneGeometry(world.size, world.size, world.segs, world.segs);
+      terrainGeo.rotateX(-Math.PI/2);
+      var tPos = terrainGeo.attributes.position;
+      var tColors = new Float32Array(tPos.count * 3);
+      // 흙색 계열(연한 갈색) 팔레트 — 기존엔 슬레이트/카키 톤이 이미 어두워서, 아래
+      // 접지음영(AO)이나 그림자와 곱해지면 거의 검은색으로 뭉개져 "건물이 허공에 떠
+      // 있는" 것처럼 보이는 원인이 되었다(실제로는 지오메트리가 다 붙어 있는데, 그
+      // 위 지형 색이 너무 어두워 눈으로 구분이 안 됐던 것 — 레이캐스트로 확인함).
+      var lowC = new THREE.Color(0x5a4632), midC = new THREE.Color(0x7d6748), highC = new THREE.Color(0x9c8760);
+
+      // 도로 근접 음영만 적용한다. 건물 근접 AO는 검은 외곽 띠로 보였으므로 적용하지 않는다.
+      // AO_MIN_SHADE를 너무 낮게 잡으면(예: 0.22) 위 흙색과 곱해진 뒤 그림자까지 겹쳐서
+      // 다시 새까맣게 뭉개지므로, 어두워지되 "그늘진 흙"으로는 보이도록 여유를 둔다.
+      var ROAD_AO_BUFFER = 2.4, AO_MIN_SHADE = 0.55;
+      var roads = TD.roads;
+
+      for (var k=0; k<tPos.count; k++){
+        var hgt = TD.heights[k];
+        tPos.setY(k, hgt);
+        var tNorm = (hgt - world.minHeight) / Math.max(1, (world.maxHeight - world.minHeight));
+        var col = tNorm < 0.5
+          ? lowC.clone().lerp(midC, tNorm/0.5)
+          : midC.clone().lerp(highC, (tNorm-0.5)/0.5);
+
+        var ex = tPos.getX(k), ez = tPos.getZ(k), north = -ez;
+        var shade = 1.0;
+
+        for (var ri=0; ri<roads.length; ri++){
+          var road = roads[ri];
+          var halfW = (road.tier === "major" ? world.roadWidth.major : world.roadWidth.minor) / 2;
+          for (var pi=0; pi<road.pts.length-1; pi++){
+            var ra = road.pts[pi], rb = road.pts[pi+1];
+            var d = distToSegment(ex, north, ra[0], ra[1], rb[0], rb[1]);
+            if (d <= halfW + ROAD_AO_BUFFER){
+              var t = Math.max(0, (d - halfW) / ROAD_AO_BUFFER);
+              shade = Math.min(shade, AO_MIN_SHADE + (1 - AO_MIN_SHADE) * t);
+            }
+          }
+        }
+
+        col.multiplyScalar(shade);
+        tColors[k*3] = col.r; tColors[k*3+1] = col.g; tColors[k*3+2] = col.b;
+      }
+      tPos.needsUpdate = true;
+      terrainGeo.setAttribute("color", new THREE.BufferAttribute(tColors, 3));
+      terrainGeo.computeVertexNormals();
+      // emissive로 아주 어두운 흙색 최저 명도를 깔아둔다 — 그림자/AO/야간 프리셋이
+      // 겹쳐도(특히 밤 프리셋: 조도 낮은 ambient만 있고 그림자까지 지면) 지형이
+      // 완전히 새까매져 실루엣과 구분이 안 되는 일이 없도록 하는 안전장치.
+      var terrainMesh = new THREE.Mesh(
+        terrainGeo,
+        new THREE.MeshStandardMaterial({
+          vertexColors:true, roughness:0.95, metalness:0,
+          emissive:0x14100a, emissiveIntensity:1
+        })
+      );
+      terrainMesh.receiveShadow = true;
+      scene.add(terrainMesh);
+    }
+
+    // 세그먼트 양 끝점의 실제 지형고도를 정점 위치에 직접 고정하는 쐐기형(ramp) 프리즘.
+    // 이전엔 세그먼트마다 독립적으로 두께를 계산하는 BoxGeometry를 썼는데, 경사면에서는
+    // 세그먼트별 두께/중심고도가 서로 달라져 (1) 이웃 세그먼트가 만나는 지점의 높이가
+    // 어긋나 도로가 계단처럼 끊겨 보이고, (2) 두 끝점 고도차가 큰 구간은 두께가 과도하게
+    // 두꺼워져 벽처럼 솟아 보이는 문제가 있었다. 여기서는 상판 꼭짓점을 sampleHeight()
+    // 결과값에 그대로 맞춰 배치하므로, 같은 지점을 공유하는 이웃 세그먼트는 항상 정확히
+    // 같은 높이에서 만나고, 두께는 슬로프와 무관하게 항상 일정하게 유지된다.
+    function addRoadSegmentMesh(ax, az, bx, bz, halfW, burial, mat, topA, topB){
+      var dx = bx-ax, dz = bz-az;
+      var len = Math.sqrt(dx*dx + dz*dz);
+      if (len < 0.01) return;
+      var ux = dx/len, uz = dz/len;
+      var px = -uz*halfW, pz = ux*halfW;
+      var botA = topA - burial, botB = topB - burial;
+
+      var pos = new Float32Array([
+        ax+px, topA, az+pz,   ax-px, topA, az-pz,   // 0 A-left-top, 1 A-right-top
+        bx+px, topB, bz+pz,   bx-px, topB, bz-pz,   // 2 B-left-top, 3 B-right-top
+        ax+px, botA, az+pz,   ax-px, botA, az-pz,   // 4 A-left-bot, 5 A-right-bot
+        bx+px, botB, bz+pz,   bx-px, botB, bz-pz    // 6 B-left-bot, 7 B-right-bot
+      ]);
+      var idx = [
+        0,1,2, 1,3,2,   // top
+        4,6,5, 5,6,7,   // bottom
+        0,6,4, 0,2,6,   // left side
+        1,5,7, 1,7,3,   // right side
+        0,5,1, 0,4,5,   // start cap
+        2,3,7, 2,7,6    // end cap
+      ];
+      var geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      geo.setIndex(idx);
+      geo.computeVertexNormals();
+      var mesh = new THREE.Mesh(geo, mat);
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+    }
+
+    // 다리 시작/끝 쪽 몇 개 점에서는 여유고를 0으로 서서히 낮춰(램프) 일반 도로와
+    // 자연스럽게 이어지는 것처럼 보이게 한다. 실제 접속램프가 박스 바깥에 있더라도,
+    // 박스 경계에서 지면 높이로 낮춰두면 "허공에 뜬 판"이 아니라 "어딘가로 이어지는
+    // 도로"로 읽힌다.
+    function bridgeClearanceAt(idx, count){
+      var rampN = Math.min(3, Math.floor(count/3) || 1);
+      var t = Math.min(idx, count-1-idx, rampN) / rampN;
+      return world.bridgeClearance * t;
+    }
+
+    function buildRoads(){
+      // MeshBasicMaterial은 조명을 전혀 받지 않아 시간대와 무관하게 항상 같은 밝기로
+      // 떠 보였다 — 지형/건물과 같은 라이팅을 받도록 MeshStandardMaterial로 통일.
+      var roadMatMajor = new THREE.MeshStandardMaterial({color:0xcdd3ce, roughness:0.9});
+      var roadMatMinor = new THREE.MeshStandardMaterial({color:0x6c766f, roughness:0.95});
+      var pierMat = new THREE.MeshStandardMaterial({color:0x63696e, roughness:0.8});
+      var BURIAL = 0.5; // 상판에서 아래로 파묻는 두께 — 슬로프와 무관하게 항상 일정
+      var PIER_R = 0.55;
+      var PIER_SPACING = 18; // 교각 간격(m) — OSM 점 간격이 이보다 넓으면 중간에 추가로 세움
+
+      function addPier(px, pn, clearance){
+        var pz = -pn;
+        var groundY = world.sampleHeight(px, pz);
+        var deckY = groundY + clearance - BURIAL;
+        var pierH = deckY - groundY;
+        if (pierH <= 0.6) return; // 램프 접속부처럼 지면에 거의 붙는 구간엔 교각이 필요 없음
+        var pier = new THREE.Mesh(
+          new THREE.CylinderGeometry(PIER_R, PIER_R * 1.3, pierH, 10),
+          pierMat
+        );
+        pier.position.set(px, groundY + pierH/2, pz);
+        pier.castShadow = true;
+        pier.receiveShadow = true;
+        scene.add(pier);
+      }
+
+      world.data.roads.forEach(function(road){
+        var mat = road.tier === "major" ? roadMatMajor : roadMatMinor;
+        var halfW = (road.tier === "major" ? world.roadWidth.major : world.roadWidth.minor) / 2;
+        var n = road.pts.length;
+        for (var i=0; i<n-1; i++){
+          var a = road.pts[i], b = road.pts[i+1];
+          var ax = a[0], az = -a[1], bx = b[0], bz = -b[1];
+          var topA, topB;
+          if (road.bridge){
+            // 실제 Overpass 태그(bridge=yes)로 확인된 고가도로 구간 — 자연 지형고도에
+            // 교량 여유고를 더해 상판을 띄우고, 아래에 교각을 세워 육안으로도
+            // "고가도로"임이 드러나게 한다(충돌 판정은 기존 지면 높이 그대로 두어
+            // 다리 아래 공간은 비행 가능하게 남겨둠).
+            topA = world.sampleHeight(ax, az) + bridgeClearanceAt(i, n);
+            topB = world.sampleHeight(bx, bz) + bridgeClearanceAt(i+1, n);
+          } else {
+            topA = world.sampleHeight(ax, az) + 0.12;
+            topB = world.sampleHeight(bx, bz) + 0.12;
+          }
+          addRoadSegmentMesh(ax, az, bx, bz, halfW, BURIAL, mat, topA, topB);
+
+          if (road.bridge){
+            var clA = bridgeClearanceAt(i, n), clB = bridgeClearanceAt(i+1, n);
+            var segLen = Math.hypot(bx-ax, bz-az);
+            var steps = Math.max(1, Math.round(segLen / PIER_SPACING));
+            for (var s=0; s<steps; s++){
+              var tt = s/steps; // 세그먼트 끝점(i+1)은 다음 세그먼트 시작에서 중복 처리되므로 s=0만
+              addPier(a[0] + (b[0]-a[0])*tt, a[1] + (b[1]-a[1])*tt, clA + (clB-clA)*tt);
+            }
+          }
+        }
+        if (road.bridge) addPier(road.pts[n-1][0], road.pts[n-1][1], bridgeClearanceAt(n-1, n));
+      });
+    }
+
+    function buildBuildings(){
+      var buildingMat = new THREE.MeshStandardMaterial({color:0x2a3540, roughness:0.8});
+      world.data.buildings.forEach(function(b){
+        var shape = new THREE.Shape();
+        b.pts.forEach(function(p, idx){
+          if (idx === 0) shape.moveTo(p[0], p[1]); else shape.lineTo(p[0], p[1]);
+        });
+        // renderBaseY를 낮춘 만큼 깊이를 늘려 지붕의 기존 고도(baseY + h)는 유지한다.
+        var geo = new THREE.ExtrudeGeometry(shape, {depth:b.h + b.baseY - b.renderBaseY, bevelEnabled:false});
+        geo.rotateX(-Math.PI/2);
+        var mesh = new THREE.Mesh(geo, buildingMat);
+        mesh.position.y = b.renderBaseY;
+        // 건물 그림자는 바닥의 검은 띠와 혼동되므로 이 HUD 장면에서는 투영하지 않는다.
+        mesh.castShadow = false;
+        mesh.receiveShadow = true;
+        scene.add(mesh);
+      });
+    }
+
+    function buildCompass(){
+      compassGroup = new THREE.Group();
+      scene.add(compassGroup);
+      var RING_R = 34;
+      var ringMesh = new THREE.Mesh(
+        new THREE.RingGeometry(RING_R - 0.18, RING_R, 128),
+        new THREE.MeshBasicMaterial({color:0x3a4c58, side:THREE.DoubleSide, transparent:true, opacity:0.85})
+      );
+      ringMesh.rotation.x = -Math.PI/2;
+      ringMesh.position.y = 0.02;
+      compassGroup.add(ringMesh);
+
+      // 배경 나침반 링의 N/E/S/W, 각도 숫자 표기는 없음 — 헤딩 정보는 하단 HUD의
+      // HDG 셀에서 확인 (링/눈금선은 회전감을 위해서만 남겨둠).
+      var tickMat = new THREE.LineBasicMaterial({color:0x33475a});
+      for (var t=0; t<360; t+=10){
+        var majorTick = t % 30 === 0;
+        var r1 = RING_R - (majorTick ? 2.4 : 1.0);
+        var rad3 = t * Math.PI/180;
+        var pts = [
+          new THREE.Vector3(Math.sin(rad3)*r1, 0.03, -Math.cos(rad3)*r1),
+          new THREE.Vector3(Math.sin(rad3)*RING_R, 0.03, -Math.cos(rad3)*RING_R)
+        ];
+        compassGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), tickMat));
+      }
+    }
+
+    // 기체 형상(geometry 설명)을 읽어서 범용적으로 메시를 만든다 — 쿼드콥터든 틸트로터든 타겟
+    // 드론이든 이 함수 하나로 처리된다(재진입 가능: 호출할 때마다 독립된 그룹을 새로 만들어
+    // 반환하며, 바깥의 모듈 변수는 건드리지 않는다). 틸트 가능한 모터는 nacelle(모터 곤돌라)
+    // 그룹을 따로 만들어 nacelles 배열에 담아 반환하고, 호출한 쪽이 매 프레임 회전시킨다.
+    function buildCraft(geometry){
+      var group = new THREE.Group();
+      scene.add(group);
+      var nacelles = [];
+
+      var bodyMat = new THREE.MeshStandardMaterial({color:0x1b2733, roughness:0.6, metalness:0.15});
+      var armMat = new THREE.MeshStandardMaterial({color:0x121a20, roughness:0.7});
+      var rotorMat = new THREE.MeshStandardMaterial({color:0x5eead4, emissive:0x1c5c54, emissiveIntensity:0.5, roughness:0.4});
+      var wingMat = new THREE.MeshStandardMaterial({color:0x223038, roughness:0.7});
+
+      var bs = geometry.bodySize || {x:1.0,y:0.32,z:1.5};
+      group.add(new THREE.Mesh(new THREE.BoxGeometry(bs.x, bs.y, bs.z), bodyMat));
+
+      var noseLight = new THREE.Mesh(new THREE.SphereGeometry(0.1, 8, 8), new THREE.MeshBasicMaterial({color:0xf2f7f6}));
+      noseLight.position.set(0, bs.y*0.15, -bs.z/2 - 0.1);
+      group.add(noseLight);
+      var noseFin = new THREE.Mesh(new THREE.ConeGeometry(0.16, 0.3, 4), bodyMat);
+      noseFin.position.set(0, bs.y*0.06, -bs.z/2 - 0.15);
+      noseFin.rotation.x = -Math.PI/2;
+      noseFin.rotation.y = Math.PI/4;
+      group.add(noseFin);
+
+      if (geometry.hasWings){
+        var span = geometry.wingSpan || 3.0, chord = geometry.wingChord || 0.5;
+        var wingGeo = new THREE.BoxGeometry(span, 0.06, chord);
+        var wing = new THREE.Mesh(wingGeo, wingMat);
+        wing.position.set(0, 0, 0.1);
+        group.add(wing);
+        var tailGeo = new THREE.BoxGeometry(span*0.4, 0.05, chord*0.55);
+        var tail = new THREE.Mesh(tailGeo, wingMat);
+        tail.position.set(0, 0.05, bs.z/2 - chord*0.3);
+        group.add(tail);
+      }
+
+      (geometry.motors || []).forEach(function(m){
+        var dir = new THREE.Vector3(m.x, 0, m.z);
+        var len = dir.length();
+        dir.normalize();
+        var arm = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.055, len, 8), armMat);
+        arm.quaternion.copy(new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0), dir));
+        arm.position.set(m.x/2, 0, m.z/2);
+        group.add(arm);
+
+        // nacelle: 로터 원판 + 작은 모터 포드. tilt=0일 때 원판이 수평(추력 위쪽=MC),
+        // tilt=1일 때 로컬 X축으로 90도 돌아가 원판이 수직(추력 앞쪽=FW)이 되도록 구성.
+        var nacelle = new THREE.Group();
+        nacelle.position.set(m.x, 0, m.z);
+        var rotor = new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.34, 0.06, 16), rotorMat);
+        nacelle.add(rotor);
+        var pod = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 0.22, 8), armMat);
+        pod.rotation.x = Math.PI/2;
+        pod.position.z = -0.12;
+        nacelle.add(pod);
+        group.add(nacelle);
+        if (m.tiltable) nacelles.push(nacelle);
+
+        var navColor = m.x < 0 ? 0xff5050 : 0x50ff7a;
+        var navLight = new THREE.Mesh(new THREE.SphereGeometry(0.09, 8, 8), new THREE.MeshBasicMaterial({color:navColor}));
+        navLight.position.set(m.x, -0.03, m.z);
+        group.add(navLight);
+      });
+
+      return { group: group, nacelles: nacelles };
+    }
+
+    // group 하나를 통째로 지우는 공용 헬퍼 — 플레이어 기체(craft)와 타겟 기체(targetCraft)가
+    // 둘 다 이걸 재사용한다.
+    function disposeCraftGroup(group){
+      if (!group) return;
+      group.traverse(function(obj){
+        if (obj.isMesh){
+          obj.geometry.dispose();
+          if (Array.isArray(obj.material)) obj.material.forEach(function(mt){ mt.dispose(); });
+          else if (obj.material) obj.material.dispose();
+        }
+      });
+      scene.remove(group);
+    }
+
+    function clearCraft(){
+      disposeCraftGroup(craft);
+      craft = null;
+      tiltableNacelles = [];
+    }
+
+    function setVehicle(vehicle){
+      clearCraft();
+      var built = buildCraft(vehicle.geometry);
+      craft = built.group;
+      tiltableNacelles = built.nacelles;
+    }
+
+    // ---- 타겟 기체(선택적 계약) ----
+    function setTargetGeometry(geometry){
+      disposeCraftGroup(targetCraft);
+      var built = buildCraft(geometry);
+      targetCraft = built.group;
+      targetNacelles = built.nacelles;
+    }
+
+    function updateTargetFromState(tState){
+      if (!targetCraft) return;
+      targetCraft.visible = !!tState.active;
+      if (!tState.active) return;
+
+      var wx = tState.east, wy = tState.alt, wz = -tState.north;
+      var qYaw = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), -tState.heading);
+      var qRoll = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,1), -(tState.bank || 0));
+      targetCraft.position.set(wx, wy + 0.4, wz);
+      targetCraft.quaternion.copy(qYaw).multiply(qRoll);
+      // 타겟은 현재 두 프로필 다 tiltable 모터가 없어 targetNacelles가 비어 있지만,
+      // 나중에 틸트로터형 타겟을 추가할 경우를 대비해 플레이어와 동일하게 처리해둔다.
+      var tiltRad = (tState.tilt || 0) * Math.PI/2;
+      for (var i=0; i<targetNacelles.length; i++){
+        targetNacelles[i].rotation.x = -tiltRad;
+      }
+    }
+
+    function resize(){
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function init(canvasEl, worldModel, vehicle){
+      world = worldModel;
+      canvas = canvasEl;
+
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.1, 1000);
+      camera.position.set(0, 4.2, 9);
+
+      renderer = new THREE.WebGLRenderer({canvas: canvas, antialias:true});
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      window.addEventListener("resize", resize);
+      resize();
+
+      ambientLight = new THREE.AmbientLight(0x4a5a66, 0.95);
+      scene.add(ambientLight);
+      sun = new THREE.DirectionalLight(0xbfe8e0, 0.75);
+      sun.position.set(-30, 60, 20);
+      sun.castShadow = true;
+      sun.shadow.mapSize.set(2048, 2048);
+      sun.shadow.bias = -0.0015;
+      // 정사영 그림자 카메라 — 지도 전체(HALF*2)를 항상 덮도록 시간대와 무관하게 고정된 프러스텀 사용
+      var shadowSpan = world.halfSize + 40;
+      sun.shadow.camera.left = -shadowSpan;
+      sun.shadow.camera.right = shadowSpan;
+      sun.shadow.camera.top = shadowSpan;
+      sun.shadow.camera.bottom = -shadowSpan;
+      sun.shadow.camera.near = 1;
+      sun.shadow.camera.far = 400;
+      scene.add(sun);
+      setTimeOfDay("noon");
+
+      buildTerrain();
+      buildRoads();
+      buildBuildings();
+      buildCompass();
+      var built = buildCraft(vehicle.geometry);
+      craft = built.group;
+      tiltableNacelles = built.nacelles;
+    }
+
+    function updateFromState(state){
+      var wx = state.east, wy = state.alt, wz = -state.north;
+
+      var qYaw = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), -state.heading);
+      var qPitch = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), -state.pitch);
+      var qRoll = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,1), -state.roll);
+
+      craft.position.set(wx, wy + 0.4, wz);
+      craft.quaternion.copy(qYaw).multiply(qPitch).multiply(qRoll);
+
+      var tiltRad = (state.tilt || 0) * Math.PI/2;
+      for (var i=0; i<tiltableNacelles.length; i++){
+        tiltableNacelles[i].rotation.x = -tiltRad;
+      }
+
+      compassGroup.position.set(wx, world.sampleHeight(wx, wz) + 0.3, wz);
+
+      var back = new THREE.Vector3(0, 0, CAM_DIST).applyQuaternion(qYaw);
+      camera.position.set(wx + back.x, wy + CAM_HEIGHT, wz + back.z);
+      camera.lookAt(wx, wy + 1.0, wz);
+    }
+
+    function render(){
+      renderer.render(scene, camera);
+    }
+
+    return {
+      init: init,
+      updateFromState: updateFromState,
+      render: render,
+      resize: resize,
+      setTimeOfDay: setTimeOfDay,
+      setVehicle: setVehicle,
+      // 타겟 기체(선택적 계약) — 상단 "RENDERER 추가 계약" 참조.
+      setTargetGeometry: setTargetGeometry,
+      updateTargetFromState: updateTargetFromState
+    };
+  }
+
+  var activeRenderer = createThreeJsRenderer();
+  activeRenderer.init(document.getElementById("world"), WorldModel, FlightSim.vehicle);
+
+  // 타겟 기체 메시 생성 + 형상이 바뀔 때마다 렌더러가 다시 만들도록 연결, 초기 위치 무작위 배치.
+  activeRenderer.setTargetGeometry(TargetDrone.profile.geometry);
+  TargetDrone.setOnProfileChange(function(p){ activeRenderer.setTargetGeometry(p.geometry); });
+  TargetDrone.respawn(FlightSim);
+
+
+  // ==============================================================================
+  // MODULE: HUD — DOM 텔레메트리 표시 (렌더러 독립적, FlightSim만 읽는다)
+  // ==============================================================================
+  var HUD = (function(Sim){
+    var modeChip = document.querySelector(".mode");
+    var hdgVal = document.getElementById("hdg-val");
+    var altVal = document.getElementById("alt-val");
+    var spdVal = document.getElementById("spd-val");
+    var rollVal = document.getElementById("roll-val");
+    var pitchVal = document.getElementById("pitch-val");
+    var tiltVal = document.getElementById("tilt-val");
+    var posN = document.getElementById("pos-n");
+    var posE = document.getElementById("pos-e");
+    var rcDotEl = document.getElementById("rc-dot");
+
+    // FCC(OFP)의 실제 상태(state)는 매 프레임 연속으로 갱신되지만, HUD(VIS/SIM PC)로
+    // 나가는 텔레메트리는 ICD 9.4절이 규정한 채널별 전송 주기로만 갱신되는
+    // 샘플-홀드(sample & hold) 동작을 그대로 재현한다.
+    var telAccum = { pos:0, att:0, spd:0, hdg:0, tilt:0 };
+
+    function tick(name, dt, rateHz, fn){
+      telAccum[name] += dt;
+      var interval = 1 / rateHz;
+      if (telAccum[name] >= interval){
+        telAccum[name] -= interval;
+        fn();
+      }
+    }
+
+    function update(dt){
+      var state = Sim.state;
+      tick("hdg", dt, Sim.ICD_RATE.C04_HDG, function(){
+        var hdgDeg = Math.round(((state.heading * 180/Math.PI) % 360 + 360) % 360);
+        hdgVal.textContent = String(hdgDeg).padStart(3,"0");
+      });
+      tick("pos", dt, Sim.ICD_RATE.C01_POS, function(){
+        altVal.textContent = state.alt.toFixed(1);
+        posN.textContent = state.north.toFixed(1);
+        posE.textContent = state.east.toFixed(1);
+      });
+      tick("spd", dt, Sim.ICD_RATE.C03_SPD, function(){
+        var spd = Math.sqrt(state.vN*state.vN + state.vE*state.vE);
+        spdVal.textContent = spd.toFixed(1);
+      });
+      tick("att", dt, Sim.ICD_RATE.C02_ATT, function(){
+        var rollDeg = Math.round(state.roll * 180/Math.PI);
+        var pitchDeg = Math.round(state.pitch * 180/Math.PI);
+        rollVal.innerHTML = rollDeg + "&deg;";
+        pitchVal.innerHTML = pitchDeg + "&deg;";
+        rollVal.className = "value mono" + (Math.abs(rollDeg) > 30 ? " warn" : "");
+        pitchVal.className = "value mono" + (Math.abs(pitchDeg) > 30 ? " warn" : "");
+      });
+      tick("tilt", dt, Sim.ICD_RATE.C06_TILT, function(){
+        var tiltDeg = Math.round((state.tilt || 0) * 90);
+        tiltVal.innerHTML = tiltDeg + "&deg;";
+      });
+    }
+
+    function resetTelemetry(){
+      telAccum.pos=0; telAccum.att=0; telAccum.spd=0; telAccum.hdg=0; telAccum.tilt=0;
+    }
+
+    function setVehicleLabel(vehicle){
+      if (modeChip){
+        modeChip.innerHTML = '<span class="dot"></span>' + vehicle.label + ' MODE &middot; ICD-PXTR-HILS-001';
+      }
+    }
+
+    Sim.setOnRcSample(function(){
+      if (rcDotEl){
+        rcDotEl.classList.add("on");
+        setTimeout(function(){ rcDotEl.classList.remove("on"); }, 70);
+      }
+    });
+    Sim.setOnReset(resetTelemetry);
+    setVehicleLabel(Sim.vehicle);
+
+    return { update: update, resetTelemetry: resetTelemetry, setVehicleLabel: setVehicleLabel };
+  })(FlightSim);
+
+  // ==============================================================================
+  // 시간대 선택 버튼 — 렌더러의 setTimeOfDay()만 호출한다 (렌더러가 바뀌어도 동일하게 동작)
+  // ==============================================================================
+  var timeButtons = document.querySelectorAll(".time-btn");
+  timeButtons.forEach(function(btn){
+    btn.addEventListener("click", function(){
+      activeRenderer.setTimeOfDay(btn.dataset.time);
+      timeButtons.forEach(function(b){ b.classList.remove("active"); });
+      btn.classList.add("active");
+    });
+  });
+
+  // ==============================================================================
+  // 기체(Vehicle) 선택 버튼 — FlightSim.setVehicle() + 렌더러.setVehicle()만 호출한다.
+  // 코드를 고치지 않고도 화면에서 바로 기체를 바꿔볼 수 있게 하는 데모용 UI.
+  // (코드로 고정하고 싶다면 VEHICLES 배열 인덱스를 바꾸거나, 아래 대신
+  //  FlightSim.setVehicle(createTiltrotorVehicle())를 직접 호출해도 된다.)
+  // ==============================================================================
+  var vehicleButtons = document.querySelectorAll(".vehicle-btn");
+  vehicleButtons.forEach(function(btn){
+    btn.addEventListener("click", function(){
+      var vehicle = VEHICLES[parseInt(btn.dataset.vehicleIndex, 10)];
+      FlightSim.setVehicle(vehicle);
+      activeRenderer.setVehicle(vehicle);
+      HUD.resetTelemetry();
+      HUD.setVehicleLabel(vehicle);
+      vehicleButtons.forEach(function(b){ b.classList.remove("active"); });
+      btn.classList.add("active");
+    });
+  });
+
+  // ==============================================================================
+  // 타겟 드론 패널 — 형상/조종모드 버튼 + 재배치 버튼. TargetDrone 모듈의 공개 API만 호출한다.
+  // ==============================================================================
+  var targetShapeButtons = document.querySelectorAll(".target-shape-btn");
+  targetShapeButtons.forEach(function(btn){
+    btn.addEventListener("click", function(){
+      TargetDrone.setProfile(btn.dataset.targetShape);
+      targetShapeButtons.forEach(function(b){ b.classList.remove("active"); });
+      btn.classList.add("active");
+    });
+  });
+  var targetModeButtons = document.querySelectorAll(".target-mode-btn");
+  targetModeButtons.forEach(function(btn){
+    btn.addEventListener("click", function(){
+      TargetDrone.setMode(btn.dataset.targetMode);
+      targetModeButtons.forEach(function(b){ b.classList.remove("active"); });
+      btn.classList.add("active");
+    });
+  });
+  var targetRespawnBtn = document.getElementById("target-respawn-btn");
+  if (targetRespawnBtn){
+    targetRespawnBtn.addEventListener("click", function(){ TargetDrone.respawn(FlightSim); });
+  }
+
+  // 타겟 상태창 — ICD 텔레메트리가 아니라 단순 UI 편의 표시라 HUD 모듈과는 분리해서
+  // 매 프레임 바로 갱신한다(샘플-홀드 불필요).
+  var targetStatusEl = document.getElementById("target-status");
+  function updateTargetStatus(){
+    if (!targetStatusEl) return;
+    var t = TargetDrone.state;
+    targetStatusEl.textContent = (t.active ? "" : "(숨김) ") +
+      "SPD " + t.speed.toFixed(1) + " m/s · ALT " + t.alt.toFixed(1) + " m";
+  }
+
+
+  // ==============================================================================
+  // 메인 루프 — 각 모듈을 순서대로 호출만 한다. 렌더러/기체/타겟 교체 시 이 루프는 그대로 둔다.
+  // ==============================================================================
+  var last = performance.now();
+  function loop(now){
+    var dt = Math.min(0.05, (now - last)/1000);
+    last = now;
+    FlightSim.step(dt);
+    TargetDrone.step(dt);
+    activeRenderer.updateFromState(FlightSim.state);
+    activeRenderer.updateTargetFromState(TargetDrone.state);
+    activeRenderer.render();
+    HUD.update(dt);
+    updateTargetStatus();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
