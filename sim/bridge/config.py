@@ -83,6 +83,57 @@ ORIGIN_LAT_DEG = 37.27908611111111
 ORIGIN_LON_DEG = 127.10344722222221
 ORIGIN_ELEV_M = 68.0
 
+# ── ORIGIN_LAT/LON 위치의 지자기 자북 벡터(NED, gauss) — mavlink_link.py가 HIL_SENSOR의
+# 지자기계 값을 만들 때 이 벡터를 자세로 회전시켜 쓴다.
+#
+# ★ 실기 검증 완료(2026-09-04) ★ 예전엔 "한반도 대략치"로 (0.28, -0.03, 0.45)를 그냥
+# 고정해서 썼는데, 그 값의 복각(inclination)이 실제 이 좌표에서 PX4가 자체 계산하는
+# 기준값(estimator_status.mag_inclination_ref_deg)과 8~9° 어긋나 있었다. 처음엔 EKF2가
+# 이 정도는 넘어가지만, 오래 비행할수록 오차가 누적되어 결국 "Compass needs
+# calibration - Land now!"로 판정되고 이후 ARM이 계속 거부되는 문제로 이어졌다(HIL
+# 배선 문제가 아니라 이 근사 지자기 모델의 한계였음).
+#
+# 지금 값은 OFP 펌웨어 자신의 참조 테이블(src/lib/world_magnetic_model/
+# geo_mag_declination.cpp, IGRF 기반)을 그 파일 그대로 컴파일해 ORIGIN_LAT/LON_DEG를
+# 넣어 직접 뽑은 것 — 그래서 PX4가 스스로 계산하는 기준값과 정확히 일치한다(실측
+# mag_inclination_ref_deg=53.80567와 소수점까지 일치 확인됨):
+#   declination = -8.745102 deg, inclination = 53.805668 deg, strength = 0.510925 gauss
+#
+# ORIGIN_LAT/LON_DEG을 다른 위치로 바꾸면 이 세 값도 새로 뽑아야 한다 — PX4 소스에서:
+#   g++ -std=c++17 -I src/lib -I src/lib/world_magnetic_model probe.cpp \
+#       src/lib/world_magnetic_model/geo_mag_declination.cpp -o probe
+#   (probe.cpp가 get_mag_declination_degrees/get_mag_inclination_degrees/
+#    get_mag_strength_gauss(lat, lon)를 호출 — mathlib.h 의존은 math::constrain/degrees
+#    스텁 두 개로 대체하면 다른 PX4 헤더 없이 그 파일 하나만으로 컴파일된다)
+def _mag_ned_from_declination_inclination(declination_deg, inclination_deg, strength_gauss):
+    import math
+    decl = math.radians(declination_deg)
+    incl = math.radians(inclination_deg)
+    horiz = strength_gauss * math.cos(incl)
+    return (horiz * math.cos(decl), horiz * math.sin(decl), strength_gauss * math.sin(incl))
+
+
+MAG_NED_GAUSS = _mag_ned_from_declination_inclination(
+    declination_deg=-8.745102, inclination_deg=53.805668, strength_gauss=0.510925,
+)
+
+# ── FC(PX6c) 자동 재부팅 — "시뮬레이션 리셋 = FC 리셋" 규칙 ────────────────────
+# 브릿지를 (재)시작하거나 HUD의 RESET을 누르면 FDM은 원점·수평으로 순간 초기화되지만,
+# FC 안의 EKF2는 직전 비행의 위치/자세를 그대로 기억하고 있다. 그 상태로 새 센서값을
+# 넣으면 EKF2 입장에선 기체가 순간이동한 것이어서, 지자기/가속도 모순으로
+# cs_mag_fault가 래치되어 "Compass needs calibration - Land now!"와 함께 ARM이
+# FC 재부팅 전까지 영구 거부된다(2026-09-04 실기로 재현·확인). 그래서 두 시점에
+# NSH `reboot`을 보내 FC를 함께 초기화한다. 재부팅 ~10초 + EKF2 정렬 ~30초가 걸린다.
+# 진단 등으로 FC 상태를 유지한 채 브릿지만 다시 올려야 할 때만 False로 끈다.
+REBOOT_FCC_ON_START = True
+REBOOT_FCC_ON_RESET = True
+
+# ── FDM 지면 충돌에 실제 지형을 쓸지 여부 — sim/py/terrain_data.json은
+# quadrotor_hud_v2.html에 임베드된 TERRAIN_DATA와 동일한 내용(meta.lat/lon 위 값과
+# 일치)이다. main.py가 이 경로로 world_model.WorldModel을 만들어 FDM에 넘긴다.
+# 파일이 없거나 로드에 실패하면 기존 평지 가정(FDM.ground_alt_m)으로 자동 폴백.
+TERRAIN_DATA_PATH = "../py/terrain_data.json"  # sim/bridge/ 기준 상대경로 -> sim/py/
+
 # ── FDM(비행동역학모델) 물리 상수 — "구조 검증용 근사치". 실제 기체 제원이 나오면
 # 이 값들만 갱신하면 된다(적분 로직 자체는 fdm.py에 그대로 둬도 됨).
 FDM = {

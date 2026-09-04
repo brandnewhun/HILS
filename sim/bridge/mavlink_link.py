@@ -134,11 +134,13 @@ class MavlinkLink:
             system_status=mavutil.mavlink.MAV_STATE_ACTIVE,
         )
 
-    @staticmethod
-    def _mag_body_ned_fixed(roll, pitch, heading):
-        """단순화된 지자기 모델 — 실측 지자기 대신 대표적인 NED 지자기 벡터
-        (한반도 대략치, gauss)를 자세로 회전시켜 body 좌표로 변환한다."""
-        mag_ned = (0.28, -0.03, 0.45)
+    def _mag_body_ned_fixed(self, roll, pitch, heading):
+        """ORIGIN_LAT/LON 위치의 지자기 NED 벡터(config.MAG_NED_GAUSS — OFP 펌웨어
+        자신의 WMM 참조 테이블에서 뽑은 값이라 PX4가 계산하는 기준 복각/편각과 정확히
+        일치)를 자세로 회전시켜 body 좌표로 변환한다. 예전의 고정 근사치(0.28,-0.03,
+        0.45)는 복각이 8~9° 어긋나 장시간 비행 후 "Compass needs calibration"으로
+        ARM이 거부되는 원인이었다 — 상세는 config.MAG_NED_GAUSS 주석 참조."""
+        mag_ned = self.config.MAG_NED_GAUSS
         cr, sr = math.cos(roll), math.sin(roll)
         cp, sp = math.cos(pitch), math.sin(pitch)
         cy, sy = math.cos(heading), math.sin(heading)
@@ -317,12 +319,17 @@ class MavlinkLink:
         )
         self.last_manual_control = {"x": x, "y": y, "z": z, "r": r}
 
-    # PX4 custom_mode 인코딩(펌웨어 src/modules/commander/px4_custom_mode.h의
-    # union px4_custom_mode: uint16 reserved, uint8 main_mode, uint8 sub_mode를
-    # little-endian uint32로 읽으면 main_mode가 16비트 왼쪽 시프트된 자리에 옴).
-    # PX4_CUSTOM_MAIN_MODE_MANUAL=1 -> 1 << 16 = 65536. QGC/MAVSDK 예제에서
-    # "Manual 모드 = custom_mode 65536"으로 자주 보이는 그 상수와 동일하다.
-    PX4_CUSTOM_MODE_MANUAL = 1 << 16
+    # ★ 버그 수정(2026-09-04) ★ 이전 값 1<<16(=65536)은 HEARTBEAT.custom_mode
+    # 필드의 인코딩(px4_custom_mode.h의 union: main_mode가 16비트 시프트된 자리에
+    # 옴)과 착각한 값이었다. 하지만 MAV_CMD_DO_SET_MODE의 param2는 그 인코딩이
+    # 아니라 Commander.cpp(handle_command)가 `(uint8_t)cmd.param2`로 그대로 읽는
+    # "생 main_mode 값"이다 — PX4 자신의 `commander mode manual` NSH 구현도
+    # send_vehicle_command(DO_SET_MODE, 1, PX4_CUSTOM_MAIN_MODE_MANUAL /*=1*/)로
+    # param2에 1을 넣는다. 65536을 uint8_t로 캐스팅하면 0이 되어 버려 MANUAL(1)/
+    # POSCTL(3) 등 어떤 main_mode와도 안 맞았고, 그 결과 모드 전환 자체가 무시되어
+    # 실기가 계속 POSCTL에 머물렀다(vehicle_status.nav_state 실측으로 확인) — OFP
+    # 결함이 아니라 이 브릿지의 값 착각이었다.
+    PX4_CUSTOM_MODE_MANUAL = 1
 
     def send_set_manual_mode(self):
         """MANUAL 비행모드로 전환한다(MAV_CMD_DO_SET_MODE).
@@ -352,6 +359,15 @@ class MavlinkLink:
             0, 0, 0, 0, 0,
         )
 
+    # Commander.cpp: "Arm is forced (checks skipped) when param2 is set to a magic
+    # number." disarm(reason, forced)에서 forced=False(기본)면 착륙 판정(landed-
+    # detector) 등 정상 비행 안전조건을 통과해야 disarm이 먹힌다 — 그런데 HIL FDM은
+    # 실제 착지 감지 신호가 없고, 자세가 흐트러진 채로 몇 초 놔두면 PX4가 "아직
+    # 비행 중"으로 보고 일반 DISARM을 계속 TEMPORARILY_REJECTED로 거부한다(실기로
+    # 재현 확인). 벤치 HIL 테스트에서는 그때그때 바로 멈출 수 있어야 하므로, DISARM만
+    # 이 매직넘버로 강제 처리한다(ARM은 그대로 둬 정상 안전검사를 계속 받게 함).
+    ARM_DISARM_FORCE_MAGIC = 21196
+
     def send_arm(self, armed):
         """시동/시동해제 명령(MAV_CMD_COMPONENT_ARM_DISARM).
 
@@ -369,7 +385,8 @@ class MavlinkLink:
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0,                          # confirmation
             1.0 if armed else 0.0,      # param1: 1=arm, 0=disarm
-            0, 0, 0, 0, 0, 0,
+            0.0 if armed else float(self.ARM_DISARM_FORCE_MAGIC),  # param2
+            0, 0, 0, 0, 0,
         )
 
     # ── Channel B: FCC -> ENV (수신) ──────────────────────────────────────────

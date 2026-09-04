@@ -16,7 +16,7 @@ import math
 
 
 class FlightDynamicsModel:
-    def __init__(self, fdm_config):
+    def __init__(self, fdm_config, world=None):
         c = fdm_config
         self.mass = c["mass_kg"]
         self.g = c["gravity"]
@@ -29,10 +29,22 @@ class FlightDynamicsModel:
         self.damping = c["rate_damping"]
         self.tilt_tau = c["tilt_tau_s"]
         self.ground_alt = c["ground_alt_m"]
+        # world: world_model.WorldModel — 주어지면 실제 지형/도로/건물 지붕 중 가장
+        # 높은 면을 지면으로 쓴다(quadrotor_hud_v2.html이 그리는 것과 동일한 지형).
+        # None이면 기존처럼 ground_alt_m 평지 가정으로 동작(하위호환).
+        self.world = world
+        self.reset()
 
+    def reset(self):
+        """위치/속도/자세를 원점으로 되돌린다(HUD의 RESET 버튼 -> main.py의
+        reset 메시지 처리에서 호출). __init__도 이 메서드로 초기 상태를 만든다 —
+        두 곳의 초기값이 서로 어긋나는 일이 없도록."""
         self.roll = 0.0
         self.pitch = 0.0
         self.yaw = 0.0
+        # 자세의 진짜 상태는 이 쿼터니언(body FRD -> NED, [w,x,y,z])이다. roll/pitch/yaw는
+        # 매 step 끝에 여기서 유도해 채우는 "표시/센서용 파생값"일 뿐이다(아래 step() 주석).
+        self.quat = [1.0, 0.0, 0.0, 0.0]
         self.p = 0.0
         self.q = 0.0
         self.r = 0.0
@@ -112,23 +124,26 @@ class FlightDynamicsModel:
         self.q += (pitch_torque / self.Iyy) * dt
         self.r += (yaw_torque / self.Izz) * dt
 
-        # 자세 적분 — 쿼터니언이 아닌 각속도->오일러각 직접 적분(소각/완만한 기동 가정).
-        self.roll += self.p * dt
-        self.pitch += self.q * dt
-        self.yaw = (self.yaw + self.r * dt) % (2.0 * math.pi)
+        # ── 자세 적분: 쿼터니언 ─────────────────────────────────────────────────
+        # ★ 2026-09-04 교체 ★ 예전에는 roll += p*dt, pitch += q*dt 식으로 각속도를
+        # 오일러각에 직접 더했다("소각/완만한 기동 가정"). 그 가정은 자세가 수십 도를
+        # 넘어가면 깨진다 — body 각속도(p,q,r)와 오일러각 변화율은 같은 것이 아니고,
+        # pitch=±90° 근처에서는 특이점까지 있다. 실기 검증 중 OFP 자세 PID가 이 근사
+        # 플랜트를 상대로 발산해 기체가 여러 바퀴 뒤집혔을 때(|pitch| 889° 기록), 이
+        # 틀린 자세로 만든 가속도/지자기 값이 PX4 EKF2에 들어가 모순을 일으켰고, EKF2는
+        # 지자기 고장(cs_mag_fault)으로 래치해 "Compass needs calibration - Land now!"
+        # 와 함께 이후 ARM을 영구 거부했다(FC 재부팅 전까지). HILS의 "진실값"이 어떤
+        # 자세에서도 물리적으로 옳아야 그 뒤의 검증이 의미가 있으므로 쿼터니언으로
+        # 바꾼다. 발산 자체(OFP PID vs 근사 플랜트)는 이 파일이 아니라 실기 제원 반영
+        # 및 OFP 쪽에서 다룰 문제로 남겨둔다 — 여기서는 자세 기하학만 올바르게 한다.
+        self._integrate_attitude(dt)
+        r11, r12, r13, r21, r22, r23, r31, r32, r33 = self._dcm_body_to_ned()
+        self._update_euler_from_dcm(r11, r21, r31, r32, r33)
 
         # 추력: tilt=0(수직/MC)이면 body -Z(위), tilt=1(수평/FW)이면 body +X(전방).
         thrust_n = thrust_mix * 4.0 * self.max_thrust_motor
         s, c_ = math.sin(self.tilt * math.pi / 2.0), math.cos(self.tilt * math.pi / 2.0)
         thrust_body = (thrust_n * s / self.mass, 0.0, -thrust_n * c_ / self.mass)
-
-        cr, sr = math.cos(self.roll), math.sin(self.roll)
-        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
-        cy, sy = math.cos(self.yaw), math.sin(self.yaw)
-        # body(FRD) -> NED, ZYX(yaw-pitch-roll) 회전행렬
-        r11, r12, r13 = cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr
-        r21, r22, r23 = sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr
-        r31, r32, r33 = -sp, cp * sr, cp * cr
 
         bx, by, bz = thrust_body
         an = r11 * bx + r12 * by + r13 * bz
@@ -143,9 +158,11 @@ class FlightDynamicsModel:
         self.east += self.ve * dt
         self.pos_d += self.vd * dt
 
-        # 평지 가정 지면 충돌(실제 지형/건물은 브라우저 WorldModel에만 있음 — 3.1의
-        # v2 HUD 쪽 설명 참조). 여기서는 "땅 밑으로 내려가지 않는다"만 보장.
-        floor_d = -self.ground_alt
+        # 지면 충돌 — world가 주어지면 실제 지형/도로/건물 지붕 중 가장 높은 면을
+        # 지면으로 쓴다(quadrotor_hud_v2.html이 그리는 지형과 동일한 값). world가
+        # 없으면(단위 테스트 등) 기존 평지 가정(ground_alt_m)으로 폴백.
+        floor_alt = self.world.floor_height_at(self.east, self.north) if self.world else self.ground_alt
+        floor_d = -floor_alt
         if self.pos_d > floor_d:
             self.pos_d = floor_d
             if self.vd > 0:
@@ -176,6 +193,54 @@ class FlightDynamicsModel:
             r12 * sf_n + r22 * sf_e + r32 * sf_d,
             r13 * sf_n + r23 * sf_e + r33 * sf_d,
         )
+
+    # ── 쿼터니언 유틸 (body FRD -> NED, q=[w,x,y,z]) ─────────────────────────
+    def _integrate_attitude(self, dt):
+        """body 각속도 (p,q,r)로 dt 동안 자세 쿼터니언을 회전시킨다.
+
+        dt 동안 각속도가 일정하다고 보고 회전축 ω/|ω|, 회전각 |ω|·dt 의 회전
+        쿼터니언을 오른쪽에 곱한다(정확한 지수사상 — 1차 오일러 적분 q += 0.5·q⊗ω·dt
+        보다 큰 각속도에서 정확하고 정규화 오차도 작다). 마지막에 정규화해 수치 오차
+        누적을 막는다."""
+        wx, wy, wz = self.p, self.q, self.r
+        omega = math.sqrt(wx * wx + wy * wy + wz * wz)
+        if omega * dt < 1e-12:
+            return
+        half = 0.5 * omega * dt
+        s = math.sin(half) / omega
+        dw, dx, dy, dz = math.cos(half), wx * s, wy * s, wz * s
+        qw, qx, qy, qz = self.quat
+        # q_new = q ⊗ dq (body 프레임 각속도이므로 오른쪽 곱)
+        nw = qw * dw - qx * dx - qy * dy - qz * dz
+        nx = qw * dx + qx * dw + qy * dz - qz * dy
+        ny = qw * dy - qx * dz + qy * dw + qz * dx
+        nz = qw * dz + qx * dy - qy * dx + qz * dw
+        norm = math.sqrt(nw * nw + nx * nx + ny * ny + nz * nz) or 1.0
+        self.quat = [nw / norm, nx / norm, ny / norm, nz / norm]
+
+    def _dcm_body_to_ned(self):
+        """쿼터니언 -> 회전행렬(body FRD -> NED). 예전 ZYX 오일러 행렬과 같은 관례
+        (r31=-sin(pitch), r32=cos(pitch)sin(roll), r33=cos(pitch)cos(roll))이라
+        이 아래의 추력 변환/비중력가속 변환 코드는 그대로 쓴다."""
+        w, x, y, z = self.quat
+        r11 = 1.0 - 2.0 * (y * y + z * z)
+        r12 = 2.0 * (x * y - w * z)
+        r13 = 2.0 * (x * z + w * y)
+        r21 = 2.0 * (x * y + w * z)
+        r22 = 1.0 - 2.0 * (x * x + z * z)
+        r23 = 2.0 * (y * z - w * x)
+        r31 = 2.0 * (x * z - w * y)
+        r32 = 2.0 * (y * z + w * x)
+        r33 = 1.0 - 2.0 * (x * x + y * y)
+        return r11, r12, r13, r21, r22, r23, r31, r32, r33
+
+    def _update_euler_from_dcm(self, r11, r21, r31, r32, r33):
+        """표시/센서용 오일러각(ZYX). roll∈[-π,π], pitch∈[-π/2,π/2], yaw∈[0,2π) —
+        예전 코드와 같은 범위 관례(yaw만 0..2π로 감음). pitch=±90° 특이점에서는
+        roll/yaw가 유일하지 않지만 진실 상태는 쿼터니언이므로 물리 계산엔 영향 없음."""
+        self.roll = math.atan2(r32, r33)
+        self.pitch = -math.asin(max(-1.0, min(1.0, r31)))
+        self.yaw = math.atan2(r21, r11) % (2.0 * math.pi)
 
     def snapshot(self):
         """mavlink_link.py(HIL_SENSOR/HIL_GPS 생성)와 telemetry_hub.py(브라우저 전송)가

@@ -291,20 +291,32 @@
   .pos-readout .label{ margin-bottom:2px; }
   .pos-readout .value{ color:var(--text); }
 
+  /* 우측으로 옮기고 작게 줄인 버전 — 원래는 하단 중앙에 한 줄로 넓게 펼쳐져 있어서
+     Local NED를 attitude-cluster 쪽으로 옮긴 뒤 하단 좌측 패널들과 겹쳤다. flex-wrap +
+     좁은 max-width로 (Pitch/Roll · Yaw · Throttle) 세 그룹이 2줄로 접히게 한다. */
   .legend{
-    position:absolute; bottom:26px; left:50%; transform:translateX(-50%);
-    display:flex; align-items:center; gap:14px; padding:9px 16px;
+    position:absolute; bottom:26px; right:30px;
+    display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-end;
+    gap:5px 10px; padding:7px 10px; max-width:190px;
   }
-  .legend .group{ display:flex; align-items:center; gap:6px; }
-  .legend .group-label{ font-size:11px; color:var(--text-dim); letter-spacing:0.1em; text-transform:uppercase; margin-right:2px; }
+  .legend .group{ display:flex; align-items:center; gap:4px; }
+  .legend .group-label{ font-size:9px; color:var(--text-dim); letter-spacing:0.08em; text-transform:uppercase; margin-right:1px; }
   .key{
     display:inline-flex; align-items:center; justify-content:center;
-    min-width:22px; height:20px; padding:0 5px;
+    min-width:17px; height:16px; padding:0 4px;
     background:var(--keycap-bg); border:1px solid var(--keycap-border);
-    font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text);
+    font-family:'JetBrains Mono',monospace; font-size:9px; color:var(--text);
     border-radius:3px;
   }
-  .legend .sep{ width:1px; height:18px; background:var(--panel-border); }
+  .legend .sep{ width:1px; height:14px; background:var(--panel-border); }
+
+  /* RC->FCC / BRIDGE 연결 상태 — 화면 정중앙 위. legend에서 분리해서 뺐다. */
+  .link-status-top{
+    position:absolute; top:26px; left:50%; transform:translateX(-50%);
+    display:flex; align-items:center; gap:14px; padding:9px 16px;
+  }
+  .link-status-top .sep{ width:1px; height:18px; background:var(--panel-border); }
+  .link-status-top .rc-link{ margin-top:0; } /* .rc-link 기본 margin-top:6px는 legend(세로 줄바꿈)용 -- 여긴 가로 한 줄이라 필요 없음 */
 
   .rc-link{ display:flex; align-items:center; gap:7px; margin-top:6px; }
   .rc-link .rc-dot{
@@ -315,12 +327,6 @@
   .rc-link .rc-dot.down{ background:var(--warn); box-shadow:0 0 6px 1px rgba(242,184,75,0.35); }
   .rc-link .rc-text{ font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--text-dim); letter-spacing:0.02em; }
   .rc-link .rc-text b{ color:var(--hud); font-weight:500; }
-
-  .reset-hint{
-    position:absolute; bottom:26px; right:30px; padding:8px 12px;
-    font-size:12px; color:var(--text-dim); letter-spacing:0.06em;
-  }
-  .reset-hint .key{ margin-right:6px; }
 
   .time-selector{
     position:absolute; bottom:74px; left:50%; transform:translateX(-50%);
@@ -344,6 +350,16 @@
   .time-btn:hover{ color:var(--text); border-color:var(--keycap-border); }
   .time-btn.active{ color:var(--hud); border-color:var(--hud); background:var(--hud-soft); }
   .time-btn:focus-visible{ outline:1px solid var(--hud); outline-offset:1px; }
+
+  /* ARM 버튼 깜박임 — 브릿지가 계산한 armReady(스로틀이 PX4 ARM 조건을 만족하는
+     순간)가 true일 때만 켜진다. HUD의 W/S 스로틀은 키를 놓으면 즉시 중립으로
+     돌아가 마우스로 ARM을 누르러 가는 순간 조건이 깨지기 쉬운데, 이 표시로
+     "지금 누르면 된다"는 순간을 사람이 직접 판단하지 않고 눈으로 바로 알 수 있게 함. */
+  @keyframes arm-ready-blink{ 0%,100%{ opacity:1; } 50%{ opacity:0.25; } }
+  .time-btn.arm-ready{
+    color:var(--warn); border-color:var(--warn);
+    animation:arm-ready-blink 0.6s ease-in-out infinite;
+  }
 
   .target-panel{
     padding:10px 14px; display:flex; flex-direction:column; gap:7px;
@@ -373,18 +389,45 @@
     <div class="mode"><span class="dot"></span>HITL LIVE &middot; ICD-PXTR-HILS-001 CH&#9314;(C)</div>
   </div>
 
+  <!-- RC->FCC / BRIDGE 연결 상태 — 원래 하단 legend 안에 있었는데 화면 정중앙 위로
+       옮겼다(legend는 우측으로 옮기고 키 안내만 남김). -->
+  <div class="link-status-top panel">
+    <div class="rc-link" id="rc-tx-link" title="브라우저 → 실기 조종 입력 송신 — MANUAL_CONTROL, 10 Hz 샘플-홀드">
+      <span class="rc-dot" id="rc-tx-dot"></span>
+      <span class="rc-text"><b style="color:var(--hud)">RC&rarr;FCC</b> MANUAL_CONTROL &middot; 10 Hz</span>
+    </div>
+    <div class="sep"></div>
+    <div class="rc-link" id="bridge-link" title="PX4 브릿지 WebSocket 링크 — Channel C(ICD C-01~C-06) 텔레메트리 수신 시 점멸">
+      <span class="rc-dot" id="rc-dot"></span>
+      <span class="rc-text" id="bridge-text"><b style="color:var(--hud)">BRIDGE</b> 연결 중&hellip;</span>
+    </div>
+  </div>
+
   <!-- ARM/DISARM — HIL 모드에서는 실제 모터 PWM이 안 나가고 HIL_ACTUATOR_CONTROLS로
        대체되므로 프로펠러가 돌지 않는다. 다만 ARM을 안 하면 PX4가 액추에이터 출력을
        전부 0으로 막아 브릿지 FDM에 추력이 0으로 들어가고, 기체가 전혀 안 움직인다.
-       시동 시점을 사람이 항상 눈으로 보고 통제하도록 자동 ARM 대신 버튼으로 뒀다. -->
-  <div class="vehicle-selector panel" id="arm-panel" style="top:72px;">
+       시동 시점을 사람이 항상 눈으로 보고 통제하도록 자동 ARM 대신 버튼으로 뒀다.
+       원래 top:72px(Vehicle 패널 아래)였는데, Vehicle 패널을 숨기면서 그 자리(26px)로 올렸다. -->
+  <div class="vehicle-selector panel" id="arm-panel" style="top:26px;">
     <span class="group-label">Arm</span>
     <button type="button" class="time-btn" id="arm-btn">ARM</button>
     <button type="button" class="time-btn" id="disarm-btn">DISARM</button>
+    <!-- RESET: 위치/자세의 진실은 브릿지의 FDM에 있어서(위 904번째 줄 주석 참조)
+         브라우저 쪽만 초기화해선 다음 텔레메트리 프레임에 바로 덮어써진다. 그래서
+         {"type":"reset"}를 브릿지로 보내 FDM 자체를 원점으로 되돌린다(ARM과 동일한
+         패턴). 실기가 날고 있는 도중 갑자기 순간이동하듯 보이지 않도록, 브릿지는
+         DISARM 상태일 때만 리셋을 받아들인다. -->
+    <button type="button" class="time-btn" id="reset-btn" title="ARMED 상태에서는 무시됨 -- 먼저 DISARM">RESET</button>
     <span class="rc-text" id="arm-state" style="margin-left:4px">--</span>
+    <!-- RESET이 ARMED라서 거부됐을 때만 잠깐 나타나는 안내. arm-state(상시 ARMED/
+         DISARMED 표시)와 같은 자리에 겹쳐 쓰면 다음 텔레메트리 프레임(최대 1/30초
+         뒤)에 바로 덮어써져 버려서 안 보이므로 별도 요소로 뺐다. -->
+    <span class="rc-text" id="reset-notice" style="margin-left:8px;color:var(--warn);"></span>
   </div>
 
-  <div class="vehicle-selector panel">
+  <!-- 화면에서만 숨김(display:none) — 코드/기능은 그대로 둬서 나중에 이 style만 지우면 복원됨.
+       ARM 패널을 이 자리(top:26px)로 올렸으므로 숨긴 채로 둠. -->
+  <div class="vehicle-selector panel" style="display:none">
     <span class="group-label">Vehicle</span>
     <button type="button" class="time-btn vehicle-btn active" data-vehicle-index="0">쿼드콥터</button>
     <button type="button" class="time-btn vehicle-btn" data-vehicle-index="1">틸트로터</button>
@@ -421,12 +464,13 @@
         <div class="value mono"><span id="spd-val">0.0</span><span class="unit">m/s</span></div>
         <div class="icd-tag"><b>C-03</b> VFR_HUD &middot; 15 Hz</div>
       </div>
-    </div>
-
-    <div class="pos-readout panel">
-      <div class="label">Local NED (m)</div>
-      <div class="value mono">N <span id="pos-n">0.0</span> &nbsp; E <span id="pos-e">0.0</span></div>
-      <div class="icd-tag">LOCAL_POSITION_NED</div>
+      <!-- Local NED — 원래는 attitude-cluster 아래 별도 줄이었는데, Speed 칸 바로
+           오른쪽(같은 줄)으로 옮겼다. -->
+      <div class="panel cell" style="min-width:140px">
+        <div class="label">Local NED (m)</div>
+        <div class="value mono" style="font-size:16px">N <span id="pos-n">0.0</span> &nbsp; E <span id="pos-e">0.0</span></div>
+        <div class="icd-tag">LOCAL_POSITION_NED</div>
+      </div>
     </div>
 
     <!-- 실기 액추에이터 출력 패널 — HIL_SENSOR 진실값이 아니라 브릿지가 그대로 전달하는
@@ -438,8 +482,9 @@
       <div class="icd-tag">SERVO_OUTPUT_RAW &middot; PWM(&micro;s)</div>
     </div>
 
-    <!-- 타겟 드론 패널 — 형상/조종모드 선택 + 재배치. TargetDrone 모듈(스크립트 하단)만 건드리면 됨. -->
-    <div class="target-panel panel">
+    <!-- 타겟 드론 패널 — 형상/조종모드 선택 + 재배치. TargetDrone 모듈(스크립트 하단)만 건드리면 됨.
+         화면에서만 숨김(display:none) — 코드/기능은 그대로 둬서 나중에 이 style만 지우면 복원됨. -->
+    <div class="target-panel panel" style="display:none">
       <div class="target-panel-row">
         <span class="group-label">Target</span>
         <button type="button" class="time-btn target-shape-btn active" data-target-shape="quad">쿼드콥터</button>
@@ -454,7 +499,8 @@
     </div>
   </div>
 
-  <div class="time-selector panel">
+  <!-- 화면에서만 숨김(display:none) — 코드/기능은 그대로 둬서 나중에 이 style만 지우면 복원됨. -->
+  <div class="time-selector panel" style="display:none">
     <span class="group-label">Time</span>
     <button type="button" class="time-btn" data-time="dawn">새벽</button>
     <button type="button" class="time-btn" data-time="morning">아침</button>
@@ -472,23 +518,13 @@
     <div class="group"><span class="group-label">Yaw</span><span class="key">A</span><span class="key">D</span></div>
     <div class="sep"></div>
     <div class="group"><span class="group-label">Throttle</span><span class="key">W</span><span class="key">S</span></div>
-    <div class="sep"></div>
-    <div class="group"><span class="group-label">Target 선회/승강</span><span class="key">I</span><span class="key">J</span><span class="key">K</span><span class="key">L</span></div>
-    <div class="sep"></div>
-    <div class="group"><span class="group-label">Target 속도</span><span class="key">U</span><span class="key">O</span></div>
-    <div class="sep"></div>
-    <div class="rc-link" id="rc-tx-link" title="브라우저 → 실기 조종 입력 송신 — MANUAL_CONTROL, 10 Hz 샘플-홀드">
-      <span class="rc-dot" id="rc-tx-dot"></span>
-      <span class="rc-text"><b style="color:var(--hud)">RC&rarr;FCC</b> MANUAL_CONTROL &middot; 10 Hz</span>
-    </div>
-    <div class="sep"></div>
-    <div class="rc-link" id="bridge-link" title="PX4 브릿지 WebSocket 링크 — Channel C(ICD C-01~C-06) 텔레메트리 수신 시 점멸">
-      <span class="rc-dot" id="rc-dot"></span>
-      <span class="rc-text" id="bridge-text"><b style="color:var(--hud)">BRIDGE</b> 연결 중&hellip;</span>
-    </div>
+    <!-- 화면에서만 숨김(display:none) — 위 타겟 패널과 짝인 키 안내라 같이 숨김. 코드/기능은 그대로. -->
+    <div class="sep" style="display:none"></div>
+    <div class="group" style="display:none"><span class="group-label">Target 선회/승강</span><span class="key">I</span><span class="key">J</span><span class="key">K</span><span class="key">L</span></div>
+    <div class="sep" style="display:none"></div>
+    <div class="group" style="display:none"><span class="group-label">Target 속도</span><span class="key">U</span><span class="key">O</span></div>
   </div>
 
-  <div class="reset-hint panel"><span class="key">R</span>브릿지 재연결</div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -1083,14 +1119,34 @@ var TERRAIN_DATA = {"meta":{"lat":37.27908611111111,"lon":127.10344722222221,"or
   (function(Link){
     var armBtn = document.getElementById("arm-btn");
     var disarmBtn = document.getElementById("disarm-btn");
+    var resetBtn = document.getElementById("reset-btn");
     var stateEl = document.getElementById("arm-state");
+    var resetNoticeEl = document.getElementById("reset-notice");
+    var lastResetDeniedAt = 0;
     if (armBtn) armBtn.addEventListener("click", function(){ Link.send({type:"arm", armed:true}); });
     if (disarmBtn) disarmBtn.addEventListener("click", function(){ Link.send({type:"arm", armed:false}); });
+    if (resetBtn) resetBtn.addEventListener("click", function(){ Link.send({type:"reset"}); });
 
     Link.onMessage(function(pkt){
-      if (!stateEl || typeof pkt.armed !== "boolean") return;
-      stateEl.textContent = pkt.armed ? "ARMED" : "DISARMED";
-      stateEl.style.color = pkt.armed ? "var(--warn)" : "var(--text-dim)";
+      if (stateEl && typeof pkt.armed === "boolean") {
+        stateEl.textContent = pkt.armed ? "ARMED" : "DISARMED";
+        stateEl.style.color = pkt.armed ? "var(--warn)" : "var(--text-dim)";
+      }
+      // armReady: 브릿지가 지금 보내고 있는 스로틀이 PX4의 ARM 조건(throttle < -0.8,
+      // Commander.cpp의 _is_throttle_low)을 만족하는 순간에만 true. 이미 armed면
+      // 더 이상 "지금 누르라"는 신호가 필요 없으니 깜박임을 끈다.
+      if (armBtn && typeof pkt.armReady === "boolean") {
+        var shouldBlink = pkt.armReady && !pkt.armed;
+        armBtn.classList.toggle("arm-ready", shouldBlink);
+      }
+      // resetDeniedAt이 이전에 본 값보다 커졌다는 건 "방금 새로 거부됐다"는 뜻
+      // (0이면 아직 한 번도 거부된 적 없음). 값 자체는 계속 유지되므로(브릿지가
+      // 되돌리지 않음) 매 프레임 비교해서 "새로 생긴 거부"만 잡아낸다.
+      if (resetNoticeEl && typeof pkt.resetDeniedAt === "number" && pkt.resetDeniedAt > lastResetDeniedAt) {
+        lastResetDeniedAt = pkt.resetDeniedAt;
+        resetNoticeEl.textContent = "먼저 DISARM 하세요";
+        setTimeout(function(){ resetNoticeEl.textContent = ""; }, 1800);
+      }
     });
   })(BridgeLink);
 
